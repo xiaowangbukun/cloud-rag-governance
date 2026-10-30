@@ -1,0 +1,81 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-config
+  namespace: cloud-governance
+data:
+  APP_ENV: "prod"
+  LOG_FORMAT: "json"
+  LOG_LEVEL: "INFO"
+  DB_DIALECT: "postgresql"
+  DB_HOST: "postgres"
+  DB_PORT: "5432"
+  DB_NAME: "governance"
+  # 这里的 DB_USER 是**属主**身份，留给运维任务（备份 09 / 演练 11 / 迁移 12）。
+  # 业务 api 在 04-api.yaml 里覆盖为 rg_app（只 DML、NOSUPERUSER NOBYPASSRLS），
+  # 否则 RLS 会被超级用户绕过。
+  DB_USER: "governance"
+  DB_SSLMODE: "require"
+  # schema 由 12-schema-job.yaml 以属主身份初始化；api 的运行角色没有 DDL 权限，
+  # 开启本项会让启动直接因权限不足失败。应用侧只校验 schema 是否就绪。
+  DB_MIGRATE_ON_STARTUP: "false"
+  AUTH_MODE: "oidc"
+  OIDC_ISSUER: "https://sso.corp.local/realms/corp"
+  OIDC_JWKS_URL: "https://sso.corp.local/realms/corp/protocol/openid-connect/certs"
+  OIDC_AUTHORIZE_URL: "https://sso.corp.local/realms/corp/protocol/openid-connect/auth"
+  OIDC_TOKEN_URL: "https://sso.corp.local/realms/corp/protocol/openid-connect/token"
+  OIDC_USERINFO_URL: "https://sso.corp.local/realms/corp/protocol/openid-connect/userinfo"
+  OIDC_REDIRECT_URI: "https://governance.corp.local/auth/callback"
+  OIDC_ROLES_CLAIM: "roles"
+  OIDC_GROUPS_CLAIM: "groups"
+  OIDC_ORG_CLAIM: "org_id"
+  DEV_LOGIN_ENABLED: "false"
+  # 接入公司统一身份接口时改为 ldap / http，并在 DIRECTORY_HTTP_URL 填内部服务地址
+  DIRECTORY_MODE: "static"
+  COLLECTOR_MODE: "simulated"
+  EMBEDDING_BACKEND: "http"
+  EMBEDDING_MODEL: "BAAI/bge-m3"
+  EMBEDDING_HTTP_URL: "http://tei:80/embed"
+  MODEL_GATEWAY_ALLOW_PUBLIC: "false"
+  MODEL_ALLOWED_HOSTS: "vllm.inference.svc.cluster.local,tei.cloud-governance.svc.cluster.local"
+  SECURITY_CANARY_ENABLED: "true"
+  SECURITY_MASK_ENTITIES: "true"
+  SECURITY_COARSE_BUCKETS: "true"
+  SECURITY_REDACT_OWNER: "true"
+  SECURITY_AUDIT_ENABLED: "true"
+  SECURITY_MAX_SPAN_DAYS: "180"
+  SECURITY_QUERY_BUDGET_PER_HOUR: "60"
+  SECURITY_EXPORT_LIMIT: "200"
+  DEMO_SEED: "false"
+  CORS_ORIGINS: "https://governance.corp.local"
+  TRUSTED_HOSTS: "governance.corp.local"
+  # 指标端点：不做鉴权，只能经集群内网抓取（Ingress 不路由 /metrics）
+  METRICS_ENABLED: "true"
+  # 保留策略：由 08-retention-cronjob.yaml 每日执行。
+  # 审计与安全事件的天数只用于报告超期规模，清理任务不会删除它们。
+  RETENTION_AUDIT_DAYS: "180"
+  RETENTION_SECURITY_EVENT_DAYS: "365"
+  RETENTION_SNAPSHOT_DETAIL_MONTHS: "12"
+  RETENTION_RUNTIME_STATE_HOURS: "24"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: api-secrets
+  namespace: cloud-governance
+type: Opaque
+stringData:
+  # 生产请用 ExternalSecret / SealedSecret / KMS 注入，严禁提交明文。
+  # 以下 REPLACE_VIA_EXTERNAL_SECRET 为部署占位符：保留该值启动时
+  # 配置校验会直接拒绝（见 config.py 生产环境弱密钥检查），
+  # 防止有人误把占位符当密钥上线导致 JWT 可伪造。
+  DB_PASSWORD: "REPLACE_VIA_EXTERNAL_SECRET"
+  # 运行角色 rg_app 的独立密码（见 12-schema-job.yaml 建角色 / 04-api.yaml 使用）。
+  # 与 DB_PASSWORD（属主）分开，避免业务进程拿到属主凭据而绕过 RLS。
+  DB_APP_PASSWORD: "REPLACE_VIA_EXTERNAL_SECRET"
+  SECRET_KEY: "REPLACE_VIA_EXTERNAL_SECRET"
+  SECURITY_TOKEN_SALT: "REPLACE_VIA_EXTERNAL_SECRET"
+  OIDC_CLIENT_ID: "cloud-governance"
+  OIDC_CLIENT_SECRET: "REPLACE_VIA_EXTERNAL_SECRET"
+  DIRECTORY_HTTP_TOKEN: "REPLACE_VIA_EXTERNAL_SECRET"
+  INTERNAL_INFERENCE_API_KEY: ""

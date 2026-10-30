@@ -1,0 +1,65 @@
+# 数据保留任务：按 README「数据保留与归档」执行，每日一次。
+#
+# 为什么是独立的 CronJob 而不是 API 进程内的调度器：
+# - API 是 replicas: 2 + HPA，进程内定时器会按副本数重复执行，清理任务必须幂等
+#   且只跑一次；
+# - 清理失败的排查入口要独立于业务进程（Job 的日志与事件不会被滚动发布冲掉）；
+# - 清理需要「可以停机重跑」的语义，Job 的 backoff/超时天然满足。
+#
+# 复用 API 镜像（代码同源，避免第二套依赖与版本漂移），但**不传 --bootstrap**：
+# 建表与种子由 API 启动时完成，清理任务只应做清理，不该顺带跑向量回填。
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: retention
+  namespace: cloud-governance
+  labels:
+    app: retention
+spec:
+  # 每天 03:30 执行，避开业务高峰。集群若低于 K8s 1.27 不支持 timeZone 字段，
+  # 删掉该字段后按 UTC 解释（等于北京时间 11:30，同样在低峰但要确认）。
+  schedule: "30 3 * * *"
+  timeZone: "Asia/Shanghai"
+  # 上一轮没跑完不叠加：清理任务之间不得并发（快照基线判定依赖稳定视图）
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 1800
+      template:
+        metadata:
+          labels:
+            app: retention
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            fsGroup: 10001
+          containers:
+            - name: retention
+              image: registry.corp.local/cloud-rag-governance/api:1.0.0
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-m", "rg_api.retention"]
+              envFrom:
+                - configMapRef:
+                    name: api-config
+                - secretRef:
+                    name: api-secrets
+              resources:
+                requests: { cpu: "100m", memory: "256Mi" }
+                limits: { cpu: "500m", memory: "512Mi" }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir: {}

@@ -1,0 +1,178 @@
+# PostgreSQL 每小时备份：pg_dump → 信封加密 → MinIO（WORM + 分层保留）。
+#
+# 为什么这么拆：
+# - initContainer 用 pgvector/pgvector:pg16 跑 pg_dump —— 备份工具与被备份库**同主版本**。
+#   pg_dump 15 连 PG16 会直接 refuse，这是最常见的「备份脚本看起来对、跑起来失败」。
+# - 主容器用 API 镜像跑 rg_api.backup —— 加密、上传、审计都在 Python 侧，
+#   不在仓库里再维护一份 shell + openssl 的旁路实现。
+# - 加密只挂公钥：备份 Pod 即使被攻破，拿走的也只是密文（私钥不在这个命名空间）。
+#
+# 时间点：每小时 :05。rg_api.backup 只在这个整点产出日层，周一/1 号顺带产出周/月层，
+# 因此 schedule 与代码里的 DAILY_HOUR（3 点）必须一致，改一处就要改另一处。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backup-config
+  namespace: cloud-governance
+data:
+  # 备份目标独立配置：与业务库凭证、与业务 MINIO_* 均可分离
+  BACKUP_ENDPOINT: "minio.cloud-governance.svc.cluster.local:9000"
+  BACKUP_BUCKET: "cloud-rag-backup"
+  # MinIO 启用 TLS 时保持 true；内网未启用 TLS 时改成 false 并接受「明文内网传输」
+  BACKUP_SECURE: "true"
+  BACKUP_PREFIX: "pg"
+  # 合规要求 WORM：COMPLIANCE 模式下保留期内连存储管理员也删不掉。
+  # 注意反过来也成立：**误备份的坏库在保留期内也删不掉**，容量要按最坏情况留。
+  # 四层保留期必须与 MinIO 生命周期规则（10-minio.yaml 的 bootstrap 作业）逐一对齐。
+  BACKUP_WORM_MODE: "COMPLIANCE"
+  BACKUP_HOURLY_RETENTION_DAYS: "7"
+  BACKUP_DAILY_RETENTION_DAYS: "30"
+  BACKUP_WEEKLY_RETENTION_DAYS: "90"
+  BACKUP_MONTHLY_RETENTION_DAYS: "365"
+  BACKUP_PUBLIC_KEY_PATH: "/etc/backup/pubkey.pem"
+  BACKUP_DRILL_DB_MARKER: "drill"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: backup-secrets
+  namespace: cloud-governance
+type: Opaque
+stringData:
+  # 备份专用 S3 凭证：**不要复用**业务读写凭证，只授予目标桶的 PutObject/ListBucket。
+  # 生产请用 ExternalSecret / SealedSecret / KMS 注入。
+  BACKUP_ACCESS_KEY: "REPLACE_VIA_EXTERNAL_SECRET"
+  BACKUP_SECRET_KEY: "REPLACE_VIA_EXTERNAL_SECRET"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: backup-public-key
+  namespace: cloud-governance
+type: Opaque
+stringData:
+  # X25519 公钥（PEM）。私钥绝不放在这个命名空间：
+  # 备份侧只需要公钥就能加密，`python -m rg_api.backup keygen` 可生成密钥对。
+  # 占位符不是合法 PEM，备份任务会以「备份公钥不可用」明确失败，而不是悄悄不加密。
+  pubkey.pem: "REPLACE_VIA_EXTERNAL_SECRET"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  namespace: cloud-governance
+  labels:
+    app: backup
+spec:
+  schedule: "5 * * * *"
+  # 必须是 UTC：upload 里判断「是不是日/周/月层」用的是 now(UTC).hour == DAILY_HOUR(3)。
+  # 若改成 Asia/Shanghai，03:05 CST 对应 19:05 UTC，日/周/月层都不会按预期产生，
+  # 表现是「小时层一直有、日层从来没有」。
+  timeZone: "UTC"
+  # 上一轮没跑完就不叠加：备份任务之间并发只会争抢数据库与带宽
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  # 失败历史留长一点：连续失败正是最需要被看见的信号
+  failedJobsHistoryLimit: 6
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      # 低于 1 小时：避免一次卡住的备份把下一小时的窗口也占掉
+      activeDeadlineSeconds: 1500
+      template:
+        metadata:
+          labels:
+            app: backup
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            fsGroup: 10001
+          initContainers:
+            - name: dump
+              image: pgvector/pgvector:pg16
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  # 等库就绪：滚动升级期间 Pod 可能先于 PG 起来
+                  for i in $(seq 1 30); do
+                    pg_isready -q && break
+                    sleep 2
+                  done
+                  pg_isready -q
+                  pg_dump -Fc --no-owner --no-privileges \
+                    --dbname="$PGDATABASE" --file=/work/pg.dump
+                  echo "dump_bytes=$(wc -c < /work/pg.dump)"
+              env:
+                - name: PGHOST
+                  valueFrom: { configMapKeyRef: { name: api-config, key: DB_HOST } }
+                - name: PGPORT
+                  valueFrom: { configMapKeyRef: { name: api-config, key: DB_PORT } }
+                - name: PGDATABASE
+                  valueFrom: { configMapKeyRef: { name: api-config, key: DB_NAME } }
+                - name: PGUSER
+                  valueFrom: { configMapKeyRef: { name: api-config, key: DB_USER } }
+                - name: PGPASSWORD
+                  valueFrom: { secretKeyRef: { name: api-secrets, key: DB_PASSWORD } }
+                - name: PGSSLMODE
+                  valueFrom: { configMapKeyRef: { name: api-config, key: DB_SSLMODE } }
+              resources:
+                requests: { cpu: "100m", memory: "128Mi" }
+                limits: { cpu: "1", memory: "1Gi" }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: work
+                  mountPath: /work
+                - name: tmp
+                  mountPath: /tmp
+          containers:
+            - name: upload
+              image: registry.corp.local/cloud-rag-governance/api:1.0.0
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-m", "rg_api.backup", "upload", "--input", "/work/pg.dump"]
+              envFrom:
+                - configMapRef:
+                    name: api-config
+                - secretRef:
+                    name: api-secrets
+                - configMapRef:
+                    name: backup-config
+                - secretRef:
+                    name: backup-secrets
+              resources:
+                requests: { cpu: "100m", memory: "256Mi" }
+                limits: { cpu: "1", memory: "1Gi" }
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: work
+                  mountPath: /work
+                - name: pubkey
+                  mountPath: /etc/backup
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: work
+              emptyDir: {}
+            - name: tmp
+              emptyDir: {}
+            - name: pubkey
+              secret:
+                secretName: backup-public-key
+                # 公钥不是敏感信息，用 0444：0400 依赖「kubelet 给 secret 卷补组读」
+                # 这一实现细节，卷插件行为不同时表现为「备份读不到公钥」的启动失败。
+                # 私钥才需要收紧，且只出现在 11 的演练 Job 里。
+                defaultMode: 0444

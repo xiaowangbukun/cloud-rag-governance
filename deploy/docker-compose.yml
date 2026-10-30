@@ -1,0 +1,65 @@
+# 本地开发 / 演示环境（SQLite + 离线向量降级，零外部依赖即可跑通）
+# 生产请用 deploy/k8s 下的清单：PostgreSQL + pgvector + TEI(BGE-M3)
+# 环境变量名与 packages/contracts/src/rg_contracts/config.py 中的 Settings 一一对应
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    image: cloud-rag-governance/api:local
+    environment:
+      APP_ENV: local
+      LOG_FORMAT: console
+      LOG_LEVEL: INFO
+      # 本地用 SQLite；生产设置 DB_DIALECT=postgresql
+      DB_DIALECT: sqlite
+      SQLITE_PATH: /srv/app/var/cloud_rag.db
+      DEMO_SEED: "true"
+      AUTH_MODE: dev
+      DIRECTORY_MODE: static
+      COLLECTOR_MODE: simulated
+      # 无 TEI 时自动降级为确定性哈希向量；设置 http 则强制走 BGE-M3 服务
+      EMBEDDING_BACKEND: http
+      EMBEDDING_MODEL: BAAI/bge-m3
+      EMBEDDING_HTTP_URL: http://tei:80/embed
+      MODEL_GATEWAY_ALLOW_PUBLIC: "false"
+      SECURITY_CANARY_ENABLED: "true"
+      SECURITY_MASK_ENTITIES: "true"
+      SECURITY_COARSE_BUCKETS: "true"
+      SECURITY_REDACT_OWNER: "true"
+      SECURITY_AUDIT_ENABLED: "true"
+      SECRET_KEY: local-dev-only-please-change
+      CORS_ORIGINS: http://localhost:8080,http://localhost:5173
+    ports:
+      - "8000:8000"
+    volumes:
+      - api-var:/srv/app/var
+    depends_on:
+      - tei
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ..
+      dockerfile: apps/web/Dockerfile
+    image: cloud-rag-governance/web:local
+    ports:
+      - "8080:8080"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # BGE-M3 向量服务（HuggingFace Text Embeddings Inference）
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
+    command: --model-id BAAI/bge-m3
+    volumes:
+      - tei-cache:/data
+    # ports:
+    #   - "8081:80"
+    restart: unless-stopped
+
+volumes:
+  api-var:
+  tei-cache:

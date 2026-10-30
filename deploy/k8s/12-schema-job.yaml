@@ -1,0 +1,176 @@
+# ---------------------------------------------------------------------------
+# schema-init：schema 初始化 + 运行角色创建（P0-1 部署前提）
+#
+# 为什么需要这个 Job：RLS 只在「连接角色不绕过策略」时成立，而属主/超级用户
+# 会绕过所有策略。所以生产把连接拆成两个身份：
+#
+#   属主（governance，拥有表） → 只跑本 Job：建表、补列、建 RLS 策略、建向量索引
+#   运行角色（rg_app，只有 DML）→ api 用它连接，受 RLS 约束，且没有 DDL 权限
+#
+# 应用侧同时把 DB_MIGRATE_ON_STARTUP 设为 false（见 01-config.yaml）：启动时
+# 只校验 schema 是否就绪，缺表直接 fail-fast，避免「部署顺序错了」被伪装成
+# 运行时 500。
+#
+# 执行顺序（部署时）：
+#   1. 在 api-secrets 注入真实的 DB_APP_PASSWORD（占位符会连接失败，这是故意的）
+#   2. kubectl apply -f 12-schema-job.yaml，等待 Job 完成
+#   3. 滚动更新 api（04-api.yaml 已把 DB_USER/DB_PASSWORD 覆盖为 rg_app/DB_APP_PASSWORD）
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: schema-sql
+  namespace: cloud-governance
+data:
+  10-app-role.sql: |
+    \set ON_ERROR_STOP on
+
+    -- 角色不存在则创建（先不带密码），随后统一 ALTER 设置密码：
+    -- 这样 CREATE 与 ALTER 两条路径都不会把密码写进 k8s 清单。
+    SELECT format('CREATE ROLE %I LOGIN NOSUPERUSER NOBYPASSRLS', :'role')
+    WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'role')
+    \gexec
+
+    -- NOSUPERUSER / NOBYPASSRLS 是 RLS 生效的前提；每次重跑都重申一遍，
+    -- 防止有人为排障临时改过角色属性后忘记改回。
+    SELECT format(
+      'ALTER ROLE %I WITH LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD %L',
+      :'role', :'app_password'
+    )
+    \gexec
+
+    GRANT CONNECT ON DATABASE :"dbname" TO :"role";
+    GRANT USAGE ON SCHEMA public TO :"role";
+    -- 只给 DML：能改表的角色可以自己 DROP POLICY，兜底就形同虚设。
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO :"role";
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO :"role";
+    REVOKE CREATE ON SCHEMA public FROM :"role";
+
+    -- 以后属主新建的表/序列自动继承同样的授权（否则每次迁移后都要手工补）。
+    ALTER DEFAULT PRIVILEGES FOR ROLE :"owner" IN SCHEMA public
+      GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO :"role";
+    ALTER DEFAULT PRIVILEGES FOR ROLE :"owner" IN SCHEMA public
+      GRANT USAGE, SELECT ON SEQUENCES TO :"role";
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: schema-init
+  namespace: cloud-governance
+spec:
+  backoffLimit: 1
+  # 成功一天后自动回收：Job 对象本身不承载状态，重跑是幂等的。
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      # app 标签必须与 06-networkpolicy.yaml 的 allow-api-to-postgres 对应：
+      # 默认拒绝入站时，没有这个标签的 Pod 连不上 PostgreSQL，Job 会以
+      # 「连接超时」失败——看起来像数据库故障，实际是策略没放行。
+      labels:
+        app: schema-init
+        job: schema-init
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      initContainers:
+        # 属主身份：建表 / 补列 / RLS 策略 / 向量索引。这些全是 DDL。
+        - name: migrate
+          image: registry.corp.local/cloud-rag-governance/api:1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "rg_contracts.db.migrate"]
+          envFrom:
+            - configMapRef:
+                name: api-config
+            - secretRef:
+                name: api-secrets
+          env:
+            # 覆盖 configMap 的 DB_USER：迁移必须用属主，运行角色没有 DDL 权限。
+            - name: DB_USER
+              value: governance
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_PASSWORD
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        # 建运行角色并授权。用 postgres 镜像只为拿到 psql（api 镜像里没有）。
+        # 连接身份同样是属主：CREATE ROLE 与 GRANT 都需要属主/超级用户权限。
+        - name: grant
+          image: pgvector/pgvector:pg16
+          command:
+            - sh
+            - -c
+            - |
+              psql \
+                -v ON_ERROR_STOP=1 \
+                -v role="$APP_ROLE" \
+                -v app_password="$DB_APP_PASSWORD" \
+                -v dbname="$DB_NAME" \
+                -v owner="$DB_USER" \
+                -f /sql/10-app-role.sql
+          env:
+            - name: APP_ROLE
+              value: rg_app
+            - name: DB_APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: api-secrets
+                  key: DB_APP_PASSWORD
+            - name: PGHOST
+              valueFrom:
+                configMapKeyRef:
+                  name: api-config
+                  key: DB_HOST
+            - name: PGPORT
+              valueFrom:
+                configMapKeyRef:
+                  name: api-config
+                  key: DB_PORT
+            - name: PGDATABASE
+              valueFrom:
+                configMapKeyRef:
+                  name: api-config
+                  key: DB_NAME
+            # 属主身份（configMap 里的 DB_USER 仍是属主，仅 api 容器覆盖为 rg_app）
+            - name: PGUSER
+              valueFrom:
+                configMapKeyRef:
+                  name: api-config
+                  key: DB_USER
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: POSTGRES_PASSWORD
+            # 与服务端一致用 require：集群内 postgres 镜像默认自带自签证书。
+            # 若这里失败，说明集群的 TLS 配置本来就有问题（api 也会连不上）。
+            - name: PGSSLMODE
+              value: require
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: sql
+              mountPath: /sql
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: sql
+          configMap:
+            name: schema-sql
+        - name: tmp
+          emptyDir: {}

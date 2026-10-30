@@ -1,0 +1,157 @@
+# 默认拒绝一切入站，仅放通声明的链路（K8s 需支持 NetworkPolicy 的 CNI）
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: cloud-governance
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-to-web
+  namespace: cloud-governance
+spec:
+  podSelector:
+    matchLabels:
+      app: web
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+  policyTypes: ["Ingress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-web-and-ingress-to-api
+  namespace: cloud-governance
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: web
+      ports:
+        - protocol: TCP
+          port: 8000
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8000
+  policyTypes: ["Ingress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-to-tei-and-postgres
+  namespace: cloud-governance
+spec:
+  podSelector:
+    matchLabels:
+      app: tei
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api
+      ports:
+        - protocol: TCP
+          port: 80
+  policyTypes: ["Ingress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-to-postgres
+  namespace: cloud-governance
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  ingress:
+    - from:
+        # API、保留任务、备份、恢复演练、schema 初始化是仅有的数据库客户端。
+        # 后四者不经过 Service，必须在此显式放通，否则「备份/清理/演练/建表」会静默失败：
+        # 连接超时的报错看起来像数据库挂了，实际是策略没放行。
+        - podSelector:
+            matchLabels:
+              app: api
+        - podSelector:
+            matchLabels:
+              app: retention
+        - podSelector:
+            matchLabels:
+              app: backup
+        - podSelector:
+            matchLabels:
+              app: restore-drill
+        - podSelector:
+            matchLabels:
+              app: schema-init
+      ports:
+        - protocol: TCP
+          port: 5432
+  policyTypes: ["Ingress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-backup-to-minio
+  namespace: cloud-governance
+spec:
+  podSelector:
+    matchLabels:
+      app: minio
+  ingress:
+    - from:
+        # 只放通备份/演练（读写对象）与一次性 bootstrap 作业（建桶/策略/生命周期）。
+        # 业务 API 不直连备份桶：备份桶凭证与业务凭证分离，网络层也一并分离。
+        - podSelector:
+            matchLabels:
+              app: backup
+        - podSelector:
+            matchLabels:
+              app: restore-drill
+        - podSelector:
+            matchLabels:
+              app: minio-bootstrap
+      ports:
+        - protocol: TCP
+          port: 9000
+  policyTypes: ["Ingress"]
+# 指标抓取：若集群使用 Prometheus Operator，需额外放通监控命名空间到 api:8000。
+# 这里不预置规则——监控命名空间的标签由客户环境决定，猜错会变成一条看似生效
+# 实则永不命中的策略。启用时按如下形态追加（namespace 标签按实际填写）：
+#
+# ---
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: allow-monitoring-to-api-metrics
+#   namespace: cloud-governance
+# spec:
+#   podSelector:
+#     matchLabels:
+#       app: api
+#   ingress:
+#     - from:
+#         - namespaceSelector:
+#             matchLabels:
+#               kubernetes.io/metadata.name: monitoring
+#       ports:
+#         - protocol: TCP
+#           port: 8000
+#   policyTypes: ["Ingress"]

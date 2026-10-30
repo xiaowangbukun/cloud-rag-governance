@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+var/
+*.db
+*.sqlite3
+# editable 安装生成的构建元数据（属于本地产物，随 pyproject.toml 重新生成）
+*.egg-info/
+build/
+
+node_modules/
+dist/
+.vite/
+
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+# pytest 的 JUnit XML 输出（CI 产物，不是源码）
+.pytest-artifacts/
+
+.idea/
+.vscode/
+.DS_Store
+
+# 本地调试/审查产生的临时脚本、输出与文件备份，不进版本库
+.workbuddy/

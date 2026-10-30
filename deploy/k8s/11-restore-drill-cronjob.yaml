@@ -1,0 +1,266 @@
+# 每周恢复演练：从 MinIO 取最新日层备份 → 解密 → 恢复到临时库 → 校验 → 删库 → 写审计。
+#
+# 为什么是「两个容器」而不是直接跑 `python -m rg_api.backup drill`：
+# - api 镜像里没有 pg_restore（它只是运行服务，不该背客户端工具）；
+# - pgvector/pgvector:pg16 里有 pg_restore/psql，但没有本仓库的 Python 代码。
+# 因此 initContainer（api 镜像）负责「下载 + 解密」（需要私钥），主容器（pg16 镜像）
+# 负责「建库 + pg_restore + 校验 + 删库 + 审计」。不要为了少一个容器去 API 镜像里
+# 塞 pg 客户端：版本漂移会让演练与真实恢复的工具版本不一致。
+#
+# 默认 suspend: true —— 这是**故意的**。本文件不提供私钥（私钥必须来自离线保管处），
+# 直接 apply 就运行只会得到一个「secret 不存在」的失败 Job。启用步骤见 README
+# 「备份与恢复演练」；确认 private key Secret 已就位后把 suspend 改成 false。
+#
+# 演练目标库的准入由两道闸门共同保证：
+#   1. 库名必须包含 BACKUP_DRILL_DB_MARKER（默认 drill）；
+#   2. 库名不得等于 DB_NAME（线上库）。
+# 与 rg_api.backup.validate_drill_target 同口径；shell 里再实现一遍是必要的——
+# 这里绕过 Python 直接执行 SQL，不能只靠调用方自觉。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: restore-drill
+  namespace: cloud-governance
+  labels:
+    app: restore-drill
+# 不需要访问 K8s API；私钥通过卷挂载读取，不用 token。
+automountServiceAccountToken: false
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-restore-drill
+  namespace: cloud-governance
+  labels:
+    app: restore-drill
+spec:
+  schedule: "0 4 * * 0"
+  timeZone: "Asia/Shanghai"
+  # 先保持关闭：没有私钥时的「失败」不是演练结论，只会训练大家忽略告警。
+  suspend: true
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # 演练失败就失败，重试只会掩盖第一次的真实错误
+      backoffLimit: 0
+      activeDeadlineSeconds: 1800
+      template:
+        metadata:
+          labels:
+            app: restore-drill
+        spec:
+          serviceAccountName: restore-drill
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            # fsGroup 只用于共享卷的组读写：两个容器 UID 不同（api=10001，pg=999）
+            fsGroup: 999
+          initContainers:
+            - name: fetch
+              image: registry.corp.local/cloud-rag-governance/api:1.0.0
+              imagePullPolicy: IfNotPresent
+              command:
+                - python
+                - -m
+                - rg_api.backup
+                - fetch
+                - --tier
+                - daily
+                - --out
+                - /work/pg.dump
+              env:
+                # 私钥只在恢复侧出现；这里的值覆盖 backup-config 里的空值。
+                # BACKUP_PUBLIC_KEY_PATH 也由 backup-config 注入，但 fetch 不读公钥，
+                # 这个容器不挂公钥卷是有意的（不需要就不挂）。
+                - name: BACKUP_PRIVATE_KEY_PATH
+                  value: /etc/backup-private/privkey.pem
+              envFrom:
+                - configMapRef:
+                    name: api-config
+                - secretRef:
+                    name: api-secrets
+                - configMapRef:
+                    name: backup-config
+                - secretRef:
+                    name: backup-secrets
+              resources:
+                requests: { cpu: "100m", memory: "256Mi" }
+                limits: { cpu: "1", memory: "1Gi" }
+              securityContext:
+                runAsUser: 10001
+                runAsGroup: 999
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: work
+                  mountPath: /work
+                - name: private-key
+                  mountPath: /etc/backup-private
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          containers:
+            - name: restore
+              image: pgvector/pgvector:pg16
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  TARGET_DB="${DRILL_DB_NAME}"
+                  AUDIT_DB="${DB_NAME}"
+
+                  # 闸门 1：名字必须带 drill 标记
+                  case "$TARGET_DB" in
+                    *"${DRILL_DB_MARKER}"*) : ;;
+                    *)
+                      echo "演练目标库名必须包含 '${DRILL_DB_MARKER}'：$TARGET_DB" >&2
+                      exit 1
+                      ;;
+                  esac
+                  # 闸门 2：不能是线上库
+                  if [ "$TARGET_DB" = "$AUDIT_DB" ]; then
+                    echo "演练目标库不能是源库：$TARGET_DB" >&2
+                    exit 1
+                  fi
+
+                  # 审计写**线上**库（演练库随后会删掉）。
+                  # metadata_json 是 jsonb：拼 JSON 片段用 ::jsonb 显式转换，
+                  # 写成字符串会让审计查询按文本处理，后续统计口径会分叉。
+                  audit() {
+                    outcome="$1"
+                    extra="${2:-}"
+                    [ -n "$extra" ] || extra='{}'
+                    psql -d "$AUDIT_DB" -v ON_ERROR_STOP=1 -q <<SQL || echo "warn: audit insert failed ($outcome)" >&2
+                  INSERT INTO audit_log (id, ts, action, outcome, metadata_json)
+                  VALUES ('aud_drill_' || to_char(clock_timestamp(), 'YYYYMMDDHH24MISSMS'),
+                          now(), 'backup_drill', '$outcome',
+                          jsonb_build_object('actor', 'system:restore-drill', 'target_db', '$TARGET_DB')
+                          || '$extra'::jsonb);
+                  SQL
+                  }
+
+                  # 任何失败都要删掉临时库，避免残留库让下一次演练直接报「库已存在」
+                  cleanup() {
+                    code=$?
+                    if [ "${TARGET_DB_CREATED:-0}" = "1" ]; then
+                      dropdb --if-exists --force "$TARGET_DB" >/dev/null 2>&1 || true
+                    fi
+                    if [ "$code" -ne 0 ]; then
+                      audit failed
+                    fi
+                    exit "$code"
+                  }
+                  trap cleanup EXIT
+
+                  # 残留库不自动删：它可能是上一次人工正在排查的现场，先让人看见
+                  exists=$(psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '$TARGET_DB'")
+                  if [ -n "$exists" ]; then
+                    echo "演练目标库已存在，先人工确认：$TARGET_DB" >&2
+                    exit 1
+                  fi
+                  createdb "$TARGET_DB"
+                  TARGET_DB_CREATED=1
+
+                  pg_restore --no-owner --no-privileges --exit-on-error \
+                    --dbname="$TARGET_DB" /work/pg.dump
+
+                  # 校验口径与 rg_api.backup._verify_restored 一致：
+                  # 结构完整 + 核心表非空 + pgvector 可用。不比对行数（dump 是快照）。
+                  missing=$(psql -d "$TARGET_DB" -tAc "
+                    SELECT string_agg(t, ',') FROM (
+                      VALUES ('user'), ('project'), ('resource'),
+                             ('knowledge_document'), ('knowledge_chunk'), ('attribution'),
+                             ('audit_log'), ('security_event'),
+                             ('snapshot'), ('snapshot_state'), ('runtime_counter')
+                    ) AS v(t)
+                    WHERE to_regclass('public.' || quote_ident(t)) IS NULL;")
+                  if [ -n "$missing" ]; then
+                    echo "恢复后缺表：$missing" >&2
+                    exit 1
+                  fi
+
+                  vector_version=$(psql -d "$TARGET_DB" -tAc \
+                    "SELECT extversion FROM pg_extension WHERE extname = 'vector'")
+                  if [ -z "$vector_version" ]; then
+                    echo "恢复后缺 vector 扩展（pgvector 未随库恢复）" >&2
+                    exit 1
+                  fi
+
+                  users=$(psql -d "$TARGET_DB" -tAc 'SELECT count(*) FROM "user"')
+                  projects=$(psql -d "$TARGET_DB" -tAc 'SELECT count(*) FROM "project"')
+                  resources=$(psql -d "$TARGET_DB" -tAc 'SELECT count(*) FROM "resource"')
+                  if [ "$users" -eq 0 ] || [ "$projects" -eq 0 ] || [ "$resources" -eq 0 ]; then
+                    echo "恢复后核心表为空：user=$users project=$projects resource=$resources" >&2
+                    exit 1
+                  fi
+
+                  table_count=$(psql -d "$TARGET_DB" -tAc \
+                    "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")
+
+                  # 先删库再写成功审计：删库失败时不该留下「演练成功」的记录
+                  dropdb --force "$TARGET_DB"
+                  TARGET_DB_CREATED=0
+
+                  extra=$(printf '{"table_count":%s,"vector_version":"%s","core_user":%s,"core_project":%s,"core_resource":%s}' \
+                    "$table_count" "$vector_version" "$users" "$projects" "$resources")
+                  audit success "$extra"
+                  echo "drill_ok target_db=$TARGET_DB table_count=$table_count vector=$vector_version"
+              env:
+                - name: PGHOST
+                  valueFrom: { configMapKeyRef: { name: api-config, key: DB_HOST } }
+                - name: PGPORT
+                  valueFrom: { configMapKeyRef: { name: api-config, key: DB_PORT } }
+                - name: PGUSER
+                  valueFrom: { configMapKeyRef: { name: api-config, key: DB_USER } }
+                - name: PGPASSWORD
+                  valueFrom: { secretKeyRef: { name: api-secrets, key: DB_PASSWORD } }
+                - name: PGSSLMODE
+                  valueFrom: { configMapKeyRef: { name: api-config, key: DB_SSLMODE } }
+                - name: DB_NAME
+                  valueFrom: { configMapKeyRef: { name: api-config, key: DB_NAME } }
+                - name: DRILL_DB_NAME
+                  # 固定名字：残留即报错。用随机名会让失败现场自动消失，
+                  # 「这次演练失败过」也就没人能查了。
+                  value: "governance_drill"
+                - name: DRILL_DB_MARKER
+                  valueFrom: { configMapKeyRef: { name: backup-config, key: BACKUP_DRILL_DB_MARKER } }
+              resources:
+                requests: { cpu: "100m", memory: "128Mi" }
+                limits: { cpu: "1", memory: "1Gi" }
+              securityContext:
+                # pgvector 镜像里 postgres 用户的 UID 是 999
+                runAsUser: 999
+                runAsGroup: 999
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: work
+                  mountPath: /work
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: work
+              emptyDir: {}
+            - name: tmp
+              emptyDir: {}
+            # 私钥不在本清单里定义（不能把「一个不存在的密钥」写成占位符就当没事）：
+            #   kubectl -n cloud-governance create secret generic backup-private-key \
+            #     --from-file=privkey.pem=/secure/offline/backup-private.pem
+            # 合规上私钥应保存在受限命名空间 / KMS / 离线介质，演练时临时投放、
+            # 用完即删（kubectl delete secret backup-private-key）。
+            # 0440 = 文件属组由 fsGroup(999) 接管后组可读，fetch 容器以 10001:999 运行；
+            # 不要用 0400：secret 卷的文件属主是 root，属主可读对非 root 容器没有意义。
+            - name: private-key
+              secret:
+                secretName: backup-private-key
+                defaultMode: 0440

@@ -1,0 +1,25 @@
+# API 的 PodDisruptionBudget。
+#
+# 为什么需要它：Deployment 是 replicas=2 + maxUnavailable=0 的滚动更新，
+# 但「滚动更新」只约束 Deployment 控制器；节点排空（drain）、集群升级、
+# 节点池缩容属于**自愿中断**，会直接按 eviction API 删 Pod —— 没有 PDB 时
+# 两个副本可能同时被驱逐，期间 API 完全不可用（readiness 也救不了正在飞的请求）。
+#
+# minAvailable=1 的取舍：允许一次只掉一个副本，保证始终有一个能服务；
+# 代价是单节点维护会被「卡住」直到另一个副本调度成功 —— 这正是期望行为，
+# 运维需要看到阻塞而不是静默丢可用性。
+#
+# 不给 web 加 PDB 是刻意的：deploy/k8s/05-web.yaml 是单副本，minAvailable=1
+# 会让任何节点排空无限期阻塞（单副本没有可让的余量），需要先扩副本再加 PDB。
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+  namespace: cloud-governance
+  labels:
+    app: api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: api

@@ -1,0 +1,127 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: cloud-governance
+  labels:
+    app: api
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      serviceAccountName: api
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: api
+          image: registry.corp.local/cloud-rag-governance/api:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: api-config
+            - secretRef:
+                name: api-secrets
+          env:
+            - name: PORT
+              value: "8000"
+            # 业务进程用**运行角色**：只 DML、NOSUPERUSER NOBYPASSRLS，RLS 才会
+            # 真正生效（属主/超级用户会绕过策略）。DDL 由 12-schema-job.yaml 的
+            # 迁移容器以属主身份完成；BACKUP/演练 Job 仍用 configMap 里的属主。
+            - name: DB_USER
+              value: rg_app
+            # 密码走独立的 DB_APP_PASSWORD 键，与属主的 DB_PASSWORD 分开，
+            # 防止业务进程顺手拿到属主凭据。
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: api-secrets
+                  key: DB_APP_PASSWORD
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { cpu: "2", memory: "4Gi" }
+          # 探针必须带 Host 头：kubelet 默认用 Pod IP 当 Host，而 prod 的
+          # TrustedHostMiddleware 只放行 TRUSTED_HOSTS（governance.corp.local），
+          # 不带 Host 会让探针稳定吃 400 —— readiness 永不通过、滚动发布卡死。
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: governance.corp.local
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+              httpHeaders:
+                - name: Host
+                  value: governance.corp.local
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: cloud-governance
+spec:
+  selector:
+    app: api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api
+  namespace: cloud-governance
+automountServiceAccountToken: false
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+  namespace: cloud-governance
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

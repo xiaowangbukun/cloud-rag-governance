@@ -1,0 +1,65 @@
+# BGE-M3 向量服务：内置向量模型，内网自持，不出网
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tei
+  namespace: cloud-governance
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tei
+  template:
+    metadata:
+      labels:
+        app: tei
+    spec:
+      containers:
+        - name: tei
+          # CPU 版便于无 GPU 环境落地；有 GPU 时换成 image: ghcr.io/huggingface/text-embeddings-inference:1.5 并加 resources.nvidia.com/gpu
+          image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
+          args: ["--model-id", "BAAI/bge-m3", "--max-client-batch-size", "32"]
+          ports:
+            - containerPort: 80
+          env:
+            - name: HF_HUB_OFFLINE
+              value: "1"
+          volumeMounts:
+            - name: cache
+              mountPath: /data
+          resources:
+            requests: { cpu: "1", memory: "4Gi" }
+            limits: { cpu: "4", memory: "8Gi" }
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      volumes:
+        - name: cache
+          persistentVolumeClaim:
+            claimName: tei-cache
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tei-cache
+  namespace: cloud-governance
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tei
+  namespace: cloud-governance
+spec:
+  selector:
+    app: tei
+  ports:
+    - port: 80
+      targetPort: 80

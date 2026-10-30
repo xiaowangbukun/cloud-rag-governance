@@ -1,0 +1,46 @@
+[project]
+name = "cloud-rag-governance-contracts"
+version = "1.0.0"
+description = "共享契约层：领域模型、安全策略、采集适配、向量检索、OIDC 与审计"
+requires-python = ">=3.11"
+dependencies = [
+    "sqlalchemy>=2.0",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "httpx>=0.27",
+    "pyjwt>=2.8",
+    "cryptography>=42",
+    "passlib>=1.7",
+    "numpy>=1.26",
+    "structlog>=24.1",
+    "pgvector>=0.3",
+    # PDF 文本抽取（knowledge/pdf.py）。纯 Python、无外部二进制，
+    # 信创离线环境可直接从内网源安装；不引入 OCR/版面分析依赖（方案 §7 明确不做）。
+    # 下限钉在 6.21.2：6.21.1 有 3 个已公开 CVE（pip-audit 门禁会直接失败），
+    # 且 PDF 解析器处理的是**用户上传的不可信文件**，这类依赖不能停留在「能用就行」。
+    "pypdf>=6.21.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+# 120 而非 100：ruff 的 E501 按 Unicode 显示宽度计数，CJK 字符记 2 列，
+# 本仓库注释/文案大量中文，100 列下中文行极易误伤（实测 100 列 102 处告警、
+# 120 列仅 5 处，且已全部修平）。选 120 是为了让 E501 能真正进 select 且零豁免。
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+# W1 门禁实集：E4/E7/E9（pycodestyle 错误类）+ F（pyflakes）+ I（import 排序）。
+# 遗留 UP/B/RUF 风格类问题（165 项基线中约 60 项）留待专项清理，不在本门禁范围内。
+# E501 于 2026-10-22 实集：此前 line-length 配了 100 但 E5 未进 select，
+# 超长行零告警（形同虚设）。现在行宽定 120 且存量告警已清零，规则真实生效。
+select = ["E4", "E7", "E9", "E501", "F", "I"]

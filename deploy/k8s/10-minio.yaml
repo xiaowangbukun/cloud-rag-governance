@@ -1,0 +1,233 @@
+# 【可选】内网单机 MinIO：备份桶 + Object Lock(WORM) + 分层生命周期 + 最小权限备份用户。
+#
+# 只有在客户没有现成 S3 兼容存储时才 apply 本文件。已有 MinIO / Ceph RGW / OBS 私有化时，
+# 只执行下面 bootstrap 作业里的等价命令即可（桶必须**建桶时**开 Object Lock，事后补不开）。
+#
+# 三个必须同时成立的约束，少一个 WORM 就形同虚设：
+#   1. 桶创建时带 Object Lock（mc mb --with-lock）+ 版本化；
+#   2. 备份程序对每个对象写入 Retain-Until（09-postgres-backup.yaml 已配置）；
+#   3. 生命周期到期天数 ≥ 对象保留期，否则「到期却删不掉」，容量只增不减。
+#
+# 【TLS】本清单只监听明文 HTTP:9000（未挂证书）。因此启用它时必须二选一：
+#   - 把 09 的 BACKUP_SECURE 改成 "false"（内网明文，接受传输不加密）；
+#   - 或者自行给 MinIO 挂证书并把 BACKUP_SECURE 保持 "true"。
+# 保持 true 去连明文端点会得到 SSL 握手失败，看起来像「凭证错误」，很容易排错跑偏。
+#
+# 【先换密钥再 apply】minio-root 与 backup-secrets 里的 REPLACE_VIA_EXTERNAL_SECRET 是
+# **固定字面量**，不是随机占位——原样部署等于用一个人人皆知的口令当 root / 备份用户。
+# 本清单没有像 API 那样在启动时校验占位符，替换责任完全落在 apply 之前。
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-root
+  namespace: cloud-governance
+type: Opaque
+stringData:
+  # 仅用于首次 bootstrap 与管理操作；日常备份使用 backup-secrets 里的最小权限用户。
+  MINIO_ROOT_USER: "REPLACE_VIA_EXTERNAL_SECRET"
+  MINIO_ROOT_PASSWORD: "REPLACE_VIA_EXTERNAL_SECRET"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+  namespace: cloud-governance
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      # WORM 的代价：保留期内删不掉，所以容量要按「保留期 × 增长速度」的最坏情况留。
+      # 当前库整库 dump 约百 KB 级，200Gi 足够覆盖数年级别的增长。
+      storage: 200Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: cloud-governance
+  labels:
+    app: minio
+spec:
+  # 单机模式必须 Recreate：两个副本同时挂同一 RWO 卷会损坏数据目录
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: minio
+          # 内部镜像仓库请钉住具体 RELEASE 版本：MinIO 的 latest 会静默变行为
+          image: minio/minio:latest
+          imagePullPolicy: IfNotPresent
+          args: ["server", "/data", "--console-address", ":9001"]
+          ports:
+            - name: s3
+              containerPort: 9000
+            - name: console
+              containerPort: 9001
+          envFrom:
+            - secretRef:
+                name: minio-root
+          resources:
+            requests: { cpu: "200m", memory: "512Mi" }
+            limits: { cpu: "1", memory: "2Gi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: s3
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: s3
+            initialDelaySeconds: 20
+            periodSeconds: 20
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minio-data
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: cloud-governance
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+  # 只暴露 S3 API；管理控制台 9001 不建 Service，需要时用 port-forward
+---
+# 一次性初始化：建 WORM 桶、打生命周期规则、创建最小权限备份用户。
+# 幂等：可重复执行（--ignore-existing / policy create 覆盖 / 用户已存在时跳过）。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-bootstrap
+  namespace: cloud-governance
+  labels:
+    app: minio-bootstrap
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: mc
+          image: minio/mc:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              for i in $(seq 1 30); do
+                mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1 && break
+                sleep 2
+              done
+              mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
+              # 1) 建桶必须在创建时开 Object Lock（事后无法补开）
+              mc mb --with-lock --ignore-existing "local/$BACKUP_BUCKET"
+              mc version enable "local/$BACKUP_BUCKET"
+              # --ignore-existing 让重复执行不报错，但也意味着「桶早就没锁」会被悄悄放过。
+              # 因此这里必须回读一次：没有 Object Lock 配置就直接失败，而不是继续贴生命周期。
+              mc retention info "local/$BACKUP_BUCKET" \
+                || { echo "桶未启用 Object Lock（需删桶重建并带 --with-lock）：$BACKUP_BUCKET" >&2; exit 1; }
+              # 2) 分层生命周期：到期天数必须 ≥ 09 里的对象保留期
+              for spec in "pg/hourly/:7" "pg/daily/:30" "pg/weekly/:90" "pg/monthly/:365"; do
+                prefix="${spec%:*}"
+                days="${spec##*:}"
+                mc ilm rule add --prefix "$prefix" --expire-days "$days" "local/$BACKUP_BUCKET" || true
+              done
+              # 3) 最小权限备份用户：只给 PutObject/GetObject/ListBucket(Versions)，不给 DeleteObject。
+              #    WORM 已禁止删保留期内对象，这里再从 IAM 侧去掉删除能力（纵深防御）。
+              #    ListBucketVersions 是**必需**的：被删除标记遮挡的备份只能从版本列表里找到
+              #    （见 rg_api.backup._list_versions）。少了它，恢复路径会退化成只看 V2 的近视眼。
+              cat > /tmp/backup-policy.json <<EOF
+              {
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Action": [
+                      "s3:PutObject",
+                      "s3:GetObject",
+                      "s3:GetObjectRetention",
+                      "s3:GetBucketLocation",
+                      "s3:ListBucket",
+                      "s3:ListBucketVersions"
+                    ],
+                    "Resource": ["arn:aws:s3:::$BACKUP_BUCKET", "arn:aws:s3:::$BACKUP_BUCKET/*"]
+                  }
+                ]
+              }
+              EOF
+              mc admin policy create local rg-backup-writer /tmp/backup-policy.json
+              mc admin user add local "$BACKUP_ACCESS_KEY" "$BACKUP_SECRET_KEY" || true
+              mc admin policy attach local rg-backup-writer --user "$BACKUP_ACCESS_KEY" || true
+              # 4) 桶级默认保留期只是兜底：真正的对象保留期由备份程序逐对象写入（09）。
+              #    7d 与小时层一致；日/周/月层会被程序写成更长的 RetainUntilDate。
+              mc retention set --default COMPLIANCE 7d "local/$BACKUP_BUCKET" || true
+              mc ilm rule ls "local/$BACKUP_BUCKET"
+              # 5) 用备份凭证本身做一次读验证：策略没生效时这里就会失败，
+              #    而不是等到第一次备份才发现 403（403 的报错文本通常看不出缺哪条权限）。
+              mc alias set backup http://minio:9000 "$BACKUP_ACCESS_KEY" "$BACKUP_SECRET_KEY" >/dev/null
+              mc ls "backup/$BACKUP_BUCKET" >/dev/null
+              echo "minio_bootstrap_ok"
+          env:
+            # mc 把 alias/配置写到 $HOME/.mc；readOnlyRootFilesystem 下 HOME 不可写，
+            # 不改这根目录会得到「mc alias set: mkdir /root/.mc: read-only file system」。
+            - name: MC_CONFIG_DIR
+              value: /tmp/.mc
+            - name: HOME
+              value: /tmp
+            - name: MINIO_ROOT_USER
+              valueFrom: { secretKeyRef: { name: minio-root, key: MINIO_ROOT_USER } }
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: minio-root, key: MINIO_ROOT_PASSWORD } }
+            - name: BACKUP_BUCKET
+              valueFrom: { configMapKeyRef: { name: backup-config, key: BACKUP_BUCKET } }
+            - name: BACKUP_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: backup-secrets, key: BACKUP_ACCESS_KEY } }
+            - name: BACKUP_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: backup-secrets, key: BACKUP_SECRET_KEY } }
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { cpu: "200m", memory: "256Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

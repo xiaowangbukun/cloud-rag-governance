@@ -1,0 +1,206 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  # 作业职责分工（全量回归只在 PG，见 backend-pg）：
+  # - backend-sqlite（本作业）：SQLite 是方言垫片/降级路径，本作业提供
+  #   不依赖 PG service 的秒级回路——Lint + 纯逻辑模块 + 冒烟。
+  # - backend-pg：PostgreSQL（生产方言，唯一真相源）全量测试套件。
+  backend-sqlite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e packages/contracts
+          pip install -e "apps/api[dev]"
+
+      - name: Lint
+        run: ruff check packages apps
+
+      # 显式 SQLite：默认方言已是 PG，这里是刻意 opt-in 的快速回路。
+      # 只跑不依赖数据库的纯逻辑模块（策略判定 / DLP 脱敏），秒级出结果。
+      - name: Test (SQLite 快速回路)
+        env:
+          RG_TEST_DIALECT: sqlite
+        run: python -m pytest apps/api/tests/test_policy.py apps/api/tests/test_security.py -q
+
+      # 契约层此前不在 CI 范围内：摄取/切块/PDF/迁移这些模块只有本地手跑过。
+      # 它们不依赖数据库与网络，放进快速回路成本极低。
+      - name: Test (契约层)
+        run: python -m pytest packages/contracts/tests -q
+
+      - name: Smoke
+        env:
+          APP_ENV: test
+          DB_DIALECT: sqlite
+          SQLITE_PATH: /tmp/smoke.db
+        run: python scripts/smoke_api.py
+
+  backend-pg:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: rgtest
+          POSTGRES_PASSWORD: rgtest
+          POSTGRES_DB: rgtest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e packages/contracts
+          pip install -e "apps/api[dev]"
+
+      # 全量回归作业：PostgreSQL 是生产方言、唯一真相源（测试默认方言）。
+      # conftest 的 PG 分支配 DEMO_SEED=true，并在导入业务模块前
+      # drop_all → create_all 重建 schema，service 容器每次运行都是干净库，
+      # 无跨轮次污染。SQLite 分支的降级路径由 backend-sqlite 覆盖。
+      # RG_TEST_DIALECT 显式写出：即使将来默认值变动，本作业也钉死在生产方言。
+      - name: Test (PostgreSQL 全量)
+        env:
+          RG_TEST_DIALECT: postgresql
+          DB_HOST: 127.0.0.1
+          DB_PORT: "5432"
+          DB_NAME: rgtest
+          DB_USER: rgtest
+          DB_PASSWORD: rgtest
+        run: python -m pytest apps/api/tests -q
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+
+  eval-gate:
+    # 检索评测门禁（P0-2）：把"检索只返回授权分片"从设计声明变成可执行断言。
+    # 与 backend-pg 分开的原因：它需要种子语料（DEMO_SEED=true）与一次
+    # 覆盖全语的 bootstrap，而 backend-pg 的夹具会 drop_all 重建 schema；
+    # 两者塞在同一个作业里会互相踩库。
+    # 门禁口径（74 题金标准，22 文档 / 54 分片）：未授权命中 > 0 或
+    # 拒答率 < 1.0 → 退出码 2；与 docs/eval-baseline.json（report_version=2）
+    # 相比召回变差 → 退出码 3。
+    # 不启用 --require-decision-grade（退出码 4）：它要求真实 embedding 后端，
+    # 而本作业只有离线降级向量，接上会恒定失败。待 BGE-M3 服务接入 CI 后再开，
+    # 那时门禁才从"没变差"升级为"数字可信"。
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: rgtest
+          POSTGRES_PASSWORD: rgtest
+          POSTGRES_DB: rgtest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      APP_ENV: test
+      DB_DIALECT: postgresql
+      DB_HOST: 127.0.0.1
+      DB_PORT: "5432"
+      DB_NAME: rgtest
+      DB_USER: rgtest
+      DB_PASSWORD: rgtest
+      DEMO_SEED: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e packages/contracts
+          pip install -e "apps/api[dev]"
+
+      - name: Bootstrap（建表 + 种子 + 向量）
+        run: python -c "from rg_api.startup import bootstrap; bootstrap()"
+
+      - name: 检索评测（泄漏 / 拒答 / 召回对照基线）
+        run: python -m rg_api.eval --compare docs/eval-baseline.json
+
+  dependency-audit:
+    # 依赖漏洞门禁：此前 CI 只跑 lint/测试/构建，第三方库爆 CVE 完全不会变红。
+    # 放在独立作业而不是塞进 frontend：它同时覆盖 Python 与 Node，
+    # 且失败原因（依赖有洞）与业务回归要能一眼区分。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install (含本地包，供扫描已装依赖)
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit
+          pip install -e packages/contracts
+          pip install -e "apps/api[dev]"
+
+      # --skip-editable：两个本地包不发布、不在漏洞库里，扫它们只会报错。
+      # 默认行为是发现漏洞即非零退出（不用 --fix，门禁只负责报，升级另行评审）。
+      - name: Python 依赖漏洞扫描
+        run: python -m pip_audit --skip-editable --progress-spinner off
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      # 只装生产依赖再扫：devDependencies（vite/eslint 等）不进运行时镜像，
+      # 它们的漏洞应通过 renovate 处理，先不要让发布门禁产生噪声。
+      - name: Node 生产依赖漏洞扫描
+        working-directory: apps/web
+        run: |
+          npm ci --omit=dev --ignore-scripts
+          npm audit --omit=dev --audit-level=high
