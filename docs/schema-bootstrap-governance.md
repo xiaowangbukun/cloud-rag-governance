@@ -492,9 +492,9 @@ P0-1 事故时这里的 `except` **没有 `rollback()`**，导致失败的 DDL �
 
 ---
 
-## 8. 实现状态（2026-10-30 更新）
+## 8. 实现状态（2026-10-31 更新）
 
-本节记录本文各方案的**实际落地情况**，避免读者把设计文档当成现状。
+本节记录本文各方案的**实际落地情况**，避免读者把设计文档当成现状。§3 是设计时的方案，落地时的两处加严/取舍（缺列也 fail-fast、`/ready` 用启动采样缓存）**以本节为准**。
 
 ### 8.1 已落地：方案 2 部件 A（`schema_version` + 注册表）
 
@@ -516,20 +516,31 @@ P0-1 事故时这里的 `except` **没有 `rollback()`**，导致失败的 DDL �
 |---|---|---|
 | `python -m rg_contracts.db.migrate` | 建表 + 执行未登记迁移 + （PG）建向量索引/RLS 策略，打印 `applied=[...]` | 0 / 异常非零 |
 | `python -m rg_contracts.db.migrate --plan` | **dry-run**：只打印待执行清单（version / 名称 / 方言 / 说明），不执行任何 DDL | 0 |
-| `python -m rg_contracts.db.migrate --verify` | 只校验缺表，不建表 | 0 通过 / 1 缺表 |
+| `python -m rg_contracts.db.migrate --verify` | 只校验 schema（缺表或缺列），不建表 | 0 通过 / 1 缺表或缺列 |
 
 `--plan` 与 `apply_pending` 共用 `pending_migrations` 这一个判定，因此「打印的清单」与「实际执行」不会分叉 —— 这正是 R10 离线变更评审要的性质。
 
-### 8.3 未落地（仍是本文的开放项）
+### 8.3 已落地：方案 2 部件 B（列级漂移比对 + `/ready` 暴露）
 
-| 项 | 状态 | 缺口 |
+| 项 | 落点 | 说明 |
 |---|---|---|
-| 部件 B：列级漂移比对 | **未做** | 现有 `verify_schema` 只比对**表是否存在**，不比对列/类型；`type_mismatch` / `extra_column` 仍不可见（R4 未关闭） |
-| `/ready` 暴露 `schema_drift` | **未做** | 漂移目前没有任何信号（与 §6 教训 3 同一个模式） |
-| K8s Schema-init Job / advisory lock | **未做** | 部署结构未改；多 Pod 同时启动仍可能并发跑 DDL（R2 / R3 未关闭） |
-| runbook 手工 SQL / 回滚步骤 | **未做** | R6 未关闭；`Migration` 数据类预留了 `description`，但还没有等价手工 DDL 字段 |
+| 列级漂移比对 | `rg_contracts/db/session.py::schema_drift` | 四类差异：`missing_table` / `missing_column` / `type_mismatch` / `extra_column`，每条带 `table` + `column` + `detail`（缺表/缺列可定位到具体列，才可操作）。**不比对索引、外键、默认值、可空性**——它们会因 `with_variant` 与双方言差异产生大量噪声，属于 R4 之外的范围 |
+| 类型渲染归一 | `session.py::_render_type` + `_TYPE_ALIASES` | 只合并**实测撞到的同义写法**（`CHARACTER VARYING→VARCHAR`、`DOUBLE PRECISION→FLOAT`、`TIMESTAMP (WITHOUT|WITH) TIME ZONE→TIMESTAMP/TIMESTAMPTZ`）+ 整词 `INT→INTEGER`；**长度/精度永不合并**，否则 `VARCHAR(32)` 与 `VARCHAR(255)` 的差异会被吞掉 |
+| fail-fast 边界 | `session.py::verify_schema` | 缺表与**缺列**都抛错（比 §3 更严：生产运行角色没有 DDL 权限，缺列就是纯运行时 500，没有理由只挡缺表）；`type_mismatch` / `extra_column` 不中途退出，只返回清单 |
+| `/ready` 暴露 | `rg_api/routes/health.py::ready` | 200 响应新增 `schema_drift`（差异清单）与 `schema_drift_checked_at`（采样时间）；503 分支与函数签名保持不变 |
+| 分级告警 | `rg_api/startup.py::_record_schema_drift` | `type_mismatch` / `extra_column` 记 `logger.error("schema_drift_detected")`（可进告警规则）；其余类别只在 warning 级别（正常会被 fail-fast 挡住，不会进入快照） |
+| 采样窗口（明示限制） | `rg_api/startup.py::schema_drift_snapshot` | 漂移在**启动时采样一次**并缓存，`/ready` 只读缓存：探针每 10 秒一次，列级 introspection 是「每张表一次查询」，放进探针会把就绪检查变成数据库负载。代价是运行时手工 `ALTER` 只能下次重启或 `migrate --verify` 才发现 |
+| 测试 | `packages/contracts/tests/test_schema_drift.py`（7 条）、`apps/api/tests/test_schema_drift_ready.py`（5 条） | 新库 0 漂移（守假阳性）、缺表/缺列 fail-fast 且报错带修复命令、多余列定位到 `table.column`、长度不合并；`/ready` 字段与快照接线、PG 生产方言实测 0 假阳性、严重类别记 ERROR |
+
+### 8.4 未落地 / 部分落地（剩余开放项）
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| K8s Schema-init Job | **已落地** | `deploy/k8s/12-schema-job.yaml`：initContainer 以属主身份跑 `python -m rg_contracts.db.migrate`（建表/补列/RLS 策略/向量索引），随后用 `psql` 建运行角色 `rg_app`（`NOSUPERUSER NOBYPASSRLS`，只授 DML）。应用侧 `DB_MIGRATE_ON_STARTUP=false`，启动时只 `verify_schema` |
+| 迁移 advisory lock | **已落地** | `schema_migrations.apply_pending` 在 PG 分支先 `pg_try_advisory_lock(hashtext('rg_contracts.db.schema_migrations'))`，抢不到记 warning 并返回 `[]`（跳过）。跳过是安全的：迁移幂等，先到者跑完后 schema 即目标状态。**残留风险**：锁是单库级、不等待，跳过者不做二次校验，依赖应用启动的 `verify_schema` 兜底；服务端被 `pg_terminate_backend` 时会话级锁会静默消失（这一点与 `apps/api/tests/conftest.py` 的防误清库闸门相同） |
+| runbook 手工 SQL / 回滚步骤 | **未做** | R6 未关闭；`Migration` 数据类预留了 `description` 供离线评审打印，但还没有等价手工 DDL 字段与升级前备份步骤 |
 | 「一次性」语义带来的变化 | **已知，已记录** | 迁移只在「本条 version 未登记」时执行。旧实现是每次启动都跑一遍全部 `_migrate_*`，所以 `_migrate_json_string_scalars` 那类**数据修复**迁移过去会自愈，现在不会。影响面是滚动更新窗口内旧 Pod 写入的历史坏形态行不再被自动修复；补救办法是删掉 `schema_version` 里对应 version 行后重跑 `python -m rg_contracts.db.migrate`（迁移本身幂等）。收益是每次启动少 13 次全表 `UPDATE`（`jsonb_typeof(...)='string'` 无法走索引） |
 
-### 8.4 关于 alembic
+### 8.5 关于 alembic
 
 `apps/api/pyproject.toml` 曾声明 `alembic>=1.13`，但仓库里**没有任何代码调用它**：没有 `alembic.ini`、没有 `migrations/` 目录、全仓无 `import alembic`。本轮核实后已把这条依赖（连同只有它使用的传递依赖 Mako / MarkupSafe）从 `pyproject.toml` 与本地 venv 中移除，避免依赖审计把它当成在用组件。按 §3 方案 3 的判据（迁移数 > 8–10、首次需要回滚、改列类型/删列/改约束、团队 ≥3 人并行），当前只有 4 条迁移，一条都没满足，因此维持「P0 不采纳」。将来满足判据要接入时，必须先生成基线 revision 并让存量库 `stamp head`，否则后续迁移会全部错位。

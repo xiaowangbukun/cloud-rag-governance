@@ -111,7 +111,9 @@
 - **已实现**：命中新增 `source` 字段 `{document_title, section_path, page_no, ordinal}`。
   `document_title` 出库前再净化一次（兜历史未脱敏标题）；`section_path` 优先取
   `knowledge_chunk.section_path` 列、回退 `metadata_json.section_path`；
-  `page_no` 只有 PDF 摄取才有——**当前产品尚无 PDF 摄取路由**，故实际恒为 `None`。
+  `page_no` 只有 PDF 摄取才会写：`POST /knowledge/documents/pdf` 已落地
+  （`apps/api/src/rg_api/routes/knowledge.py`，按页切块并把 `page_no` 写入模型列），
+  非 PDF 来源（Markdown）的命中该字段为 `None`。
 
 ---
 

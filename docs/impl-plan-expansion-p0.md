@@ -339,7 +339,7 @@ AND metrics["gpu_utilization"] < settings.GOVERNANCE_GPU_IDLE_UTIL_THRESHOLD (�
 - `apps/api/src/rg_api/routes/resources.py`（新增 `GET /resources/{id}` 详情端点，含属性投影）
 
 **改动**
-- `board` / `cost-impact`：**零改动**即可展示新 `diff_kind`（走 `diff_scope_clause`，按 `diff_kind` 分组）。仅需确认 `board` 的 `.limit(200)` 硬编码在新类型下是否足够（P1 再优化）。
+- `board` / `cost-impact`：**零改动**即可展示新 `diff_kind`（走 `diff_scope_clause`，按 `diff_kind` 分组）。（原计划的 `.limit(200)` 截断问题已修：汇总改全量聚合，列表上限 50 + `truncated` 提示，见 §4 已知局限第 2 行）
 - 新增 `GET /resources/{id}`：
   1. `_engine.check_project(subject, row.project_id)`
   2. `_engine.check_level(subject, row.project_id, row.classification)`
@@ -361,7 +361,7 @@ AND metrics["gpu_utilization"] < settings.GOVERNANCE_GPU_IDLE_UTIL_THRESHOLD (�
 **可能破坏的既有安全语义**
 - 🔴 **`GET /resources/{id}` 是新增端点，是本次扩展的唯一"新入口"**。三个必须写全：`check_project` + `check_level` + `denied` 审计。漏任何一个都会成为新的越权口。特别注意：**必须先 `check_level` 再 `load_details`**——若先查了属性再校验，虽然不影响返回值，但会把属性读进内存，违反"先授权后召回"的精神。
 - 🔴 **导出新增 `owner_team` 的边界**：`owner_team` 是团队粒度（保留），`owner` 是个人（脱敏）。若实现时图省事把 `resource.owner` 一并带上，直接违反 PRD §6.7 导出脱敏。
-- 🟡 `board` 的 `.limit(200)`：新增类型后治理项数量可能翻倍，超过 200 的部分会被静默截断，看板"看起来是空的"。P1 需改为分页或提高上限并加提示。
+- 🟢 `board` 的列表截断问题**已修**：汇总改为对全量行做聚合，列表只返回最新 50 条并以 `truncated` / `item_cap` 明示（旧实现是 `limit(200)` 后在内存累加，超过 200 时汇总数字本身偏小）。
 
 ---
 
@@ -494,7 +494,7 @@ R1（主线，S0–S7）
 | # | 局限 | 影响 | 计划 |
 |---|---|---|---|
 | 1 | 金丝雀诱饵仍只来自 `build_canaries()` 演示数据，客户新建项目无诱饵（P1-05 未修） | 金丝雀对客户真实 AI infra 数据空转 | P1-E5 做项目级自动生成 |
-| 2 | `board` 的 `.limit(200)` 硬编码 | 治理项超 200 时被静默截断，看板"看起来是空的" | P1 改分页或提高上限 + 提示 |
-| 3 | 预算（跨项目探测合成键用序号、`check_export` 零调用、进程内 dict）未修 | 防枚举/导出频次预算仍形同虚设 | 在既有修复清单内，非本扩展范围 |
+| 2 | `board` 的列表上限（原 `.limit(200)` 硬编码） | 已修：汇总改为对全量行做 `GROUP BY` / `SUM`，列表只返回最新 50 条并在响应里用 `truncated` / `item_cap` 明示；旧实现的「超 200 后汇总数字本身偏小且无提示」不再存在（`apps/api/tests/test_governance_board_aggregates.py` 守） | 已落地；若客户需要翻页再补 offset/cursor 参数 |
+| 3 | 预算（跨项目探测合成键用序号、进程内 dict）未修；`check_export` 已接入 | `enforce_export` 现在同时调用策略引擎的行数上限与 `QueryBudget.check_export`（小时频次），导出双闸门真实生效；跨项目探测的合成键与进程内 dict 仍是已知局限 | 频次闸门已生效；多副本下预算不共享，需外部计数存储才能全局一致 |
 | 4 | 锚点是否泛化为 `governed_object` 尚未定论（见 `architecture-expansion.md` §7.1） | 若客户坚持"model_endpoint 完全不进 `resource`"，需一次全量迁移 | P1 独立议题，R1 端到端跑通后再评估 |
 | 5 | 前端看板（S8）未在本计划内 | API 层闭环成立，但用户不可见 | R1 主线后补，或与客户确认延后 |

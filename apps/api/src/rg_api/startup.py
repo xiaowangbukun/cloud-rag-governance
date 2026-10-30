@@ -5,11 +5,14 @@ from __future__ import annotations
 from rg_contracts.ai.embedding import get_embedding_service
 from rg_contracts.ai.retrieval import SecureRetriever, ensure_pgvector_index
 from rg_contracts.config import DbDialect, Settings, get_settings
-from rg_contracts.db.models import KnowledgeChunk
+from rg_contracts.db.models import KnowledgeChunk, ts
 from rg_contracts.db.session import (
+    DRIFT_EXTRA_COLUMN,
+    DRIFT_TYPE_MISMATCH,
     ensure_schema,
     get_engine,
     get_session_factory,
+    schema_drift,
     session_scope,
     verify_schema,
 )
@@ -23,6 +26,55 @@ logger = get_logger(__name__)
 
 _canary_registry = None
 _bootstrapped = False
+
+#: 启动时采样的 schema 漂移快照（``/ready`` 直接读它，不在每次探针上重新 introspection）。
+#: 为什么要缓存：``/ready`` 每 10 秒被 K8s 打一次，而列级比对是「每张表一次
+#: introspection」——20 张表就是 20 次元数据查询，放在探针里会把就绪检查本身
+#: 变成数据库负载。漂移是**部署期**属性，启动采样一次足够；运行时被人手工
+#: ``ALTER`` 的情况只能下次重启/``migrate --verify`` 才发现，这是明示的采样窗口。
+_schema_drift: list[dict[str, str]] = []
+_schema_drift_checked_at: str | None = None
+
+
+def schema_drift_snapshot() -> dict[str, object]:
+    """``/ready`` 用的漂移快照：``drift`` 为差异清单，``checked_at`` 为采样时间。"""
+    return {
+        "schema_drift": list(_schema_drift),
+        "schema_drift_checked_at": _schema_drift_checked_at,
+    }
+
+
+def _record_schema_drift(drift: list[dict[str, str]]) -> None:
+    """缓存漂移并按严重度记日志：类型不一致/多余列是 ERROR，其余 WARNING。
+
+    为什么不 fail-fast：``verify_schema`` 已经把「缺表/缺列」变成启动失败；
+    剩下的 ``type_mismatch`` / ``extra_column`` 可能是存量库的历史差异，硬失败
+    会让整个升级窗口起不来。它们改为「ERROR 日志 + ``/ready`` 字段」，让监控
+    看得见、但不阻断业务。
+    """
+    global _schema_drift, _schema_drift_checked_at
+    _schema_drift = list(drift)
+    _schema_drift_checked_at = ts()
+    serious = [
+        item for item in drift if item["kind"] in (DRIFT_TYPE_MISMATCH, DRIFT_EXTRA_COLUMN)
+    ]
+    if serious:
+        logger.error(
+            "schema_drift_detected",
+            extra={
+                "extra_fields": {
+                    "count": len(serious),
+                    "sample": serious[:5],
+                    "checked_at": _schema_drift_checked_at,
+                    "fix": "以属主身份执行 `python -m rg_contracts.db.migrate --verify` 查看完整清单后人工对齐",
+                }
+            },
+        )
+    elif drift:
+        logger.warning(
+            "schema_drift_detected",
+            extra={"extra_fields": {"count": len(drift), "sample": drift[:5]}},
+        )
 
 
 def ensure_bootstrap(settings: Settings | None = None) -> None:
@@ -89,16 +141,31 @@ def _prepare_schema(settings: Settings) -> None:
         applied = ensure_schema()
         # ``applied`` 是本次真的执行了的迁移版本；空列表代表 schema 已是最新。
         # 记进启动日志，运维才能回答「这台机器升级到第几个版本了」。
+        drift = schema_drift()
         logger.info(
             "schema_ready",
-            extra={"extra_fields": {"dialect": settings.DB_DIALECT.value, "applied": applied}},
+            extra={
+                "extra_fields": {
+                    "dialect": settings.DB_DIALECT.value,
+                    "applied": applied,
+                    "drift": len(drift),
+                }
+            },
         )
+        _record_schema_drift(drift)
         return
-    verify_schema()
+    drift = verify_schema()
     logger.info(
         "schema_verified",
-        extra={"extra_fields": {"dialect": settings.DB_DIALECT.value, "migrate_on_startup": False}},
+        extra={
+            "extra_fields": {
+                "dialect": settings.DB_DIALECT.value,
+                "migrate_on_startup": False,
+                "drift": len(drift),
+            }
+        },
     )
+    _record_schema_drift(drift)
 
 
 def _check_rls_enforcement(settings: Settings) -> None:
@@ -204,9 +271,13 @@ def count_chunks(session: Session) -> int:
 
 
 def reset_runtime() -> None:
-    global _canary_registry, _bootstrapped
+    global _canary_registry, _bootstrapped, _schema_drift, _schema_drift_checked_at
     _canary_registry = None
     _bootstrapped = False
+    # 漂移快照属于「本次进程观测到的库」，换库后必须清空，否则 /ready 会把
+    # 上一个库的结论当成当前库的结论（测试里尤其容易误判）。
+    _schema_drift = []
+    _schema_drift_checked_at = None
     from rg_contracts.db.session import reset_engine_state
 
     reset_engine_state()

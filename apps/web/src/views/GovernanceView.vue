@@ -20,6 +20,9 @@ interface Board {
   by_status: Record<string, number>;
   cost_impact_cny: number;
   items: Item[];
+  // 服务端只返回最新 item_cap 条；truncated=true 表示清单被截断（汇总数字仍是全量口径）
+  truncated?: boolean;
+  item_cap?: number;
 }
 interface CostItem {
   diff_kind: string;
@@ -114,6 +117,9 @@ watch(() => props.projectId, load);
         </tbody>
       </table>
       <p v-else class="muted">暂无待处置项</p>
+      <p v-if="board?.truncated" class="muted" style="font-size: 12px; margin-top: 6px">
+        清单仅显示最新 {{ board.item_cap ?? board.items.length }} 条，共 {{ board.total }} 条；上方汇总数字为全量口径。
+      </p>
       <div class="field" style="margin-top: 10px; max-width: 480px">
         <label>处置说明（可选，随状态一同留痕）</label>
         <input v-model="note" placeholder="例如：已与项目组确认，属计划内下线" />

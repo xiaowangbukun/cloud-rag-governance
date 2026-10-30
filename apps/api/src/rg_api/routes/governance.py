@@ -29,6 +29,15 @@ _engine = default_engine()
 #: 调用方要知道自己拿到的是「全部」还是「前 N 条」。
 _EXPORT_ROW_CAP = 1000
 
+#: 看板清单单次返回的条数上限。
+#:
+#: 关键点：**汇总数字不受它影响**。``total`` / ``by_status`` / ``by_kind`` /
+#: ``cost_impact_cny`` 走独立的聚合查询（对全量行做 GROUP BY / SUM），只有
+#: ``items`` 这一项受本上限约束。旧实现先 ``limit(200)`` 取行再在内存里累加，
+#: 治理项超过 200 时**汇总本身就会偏小**，而响应里没有任何迹象——那是比
+#: 「列表少几行」严重得多的静默错数。
+_BOARD_ITEM_CAP = 50
+
 
 class ResolveRequest(BaseModel):
     status: str = Field(pattern="^(confirmed|dismissed|remediated|open)$")
@@ -46,25 +55,66 @@ def board(
     project_ids = scoped_project_ids(subject, project_id)
     scope_clause = diff_scope_clause(subject, project_ids)
     if scope_clause is None:
-        return {"total": 0, "by_status": {}, "by_kind": {}, "cost_impact_cny": 0, "items": []}
-    stmt = select(ResourceDiff).where(scope_clause)
-    rows = session.execute(stmt.order_by(ResourceDiff.detected_at.desc()).limit(200)).scalars().all()
+        return {
+            "project_id": project_id,
+            "total": 0,
+            "by_status": {},
+            "by_kind": {},
+            "cost_impact_cny": 0,
+            "items": [],
+            "truncated": False,
+            "item_cap": _BOARD_ITEM_CAP,
+        }
 
-    by_status: dict[str, int] = {}
-    by_kind: dict[str, int] = {}
-    cost = 0.0
-    for row in rows:
-        by_status[row.status] = by_status.get(row.status, 0) + 1
-        by_kind[row.diff_kind] = by_kind.get(row.diff_kind, 0) + 1
-        cost += row.cost_delta_cny or 0
+    # 汇总走数据库聚合：与 ``items`` 的条数上限彻底解耦，因此无论治理项有多少，
+    # 数字都是全量口径。
+    by_status = {
+        str(status): int(count)
+        for status, count in session.execute(
+            select(ResourceDiff.status, func.count(ResourceDiff.id))
+            .where(scope_clause)
+            .group_by(ResourceDiff.status)
+        ).all()
+    }
+    by_kind = {
+        str(kind): int(count)
+        for kind, count in session.execute(
+            select(ResourceDiff.diff_kind, func.count(ResourceDiff.id))
+            .where(scope_clause)
+            .group_by(ResourceDiff.diff_kind)
+        ).all()
+    }
+    total = sum(by_status.values())
+    cost = float(
+        session.execute(
+            select(func.coalesce(func.sum(ResourceDiff.cost_delta_cny), 0.0)).where(scope_clause)
+        ).scalar()
+        or 0
+    )
 
-    audit_action(request, session, subject, "governance:board", "allowed", project_id, metadata={"count": len(rows)})
+    # 排序带 ``id`` 兜底：同一个 ``detected_at`` 下若不给次序键，不同方言/索引
+    # 取到的行不固定，看板与导出的「最新 N 条」就不可复现（导出侧已有同款约束）。
+    rows = session.execute(
+        select(ResourceDiff)
+        .where(scope_clause)
+        .order_by(ResourceDiff.detected_at.desc(), ResourceDiff.id.desc())
+        .limit(_BOARD_ITEM_CAP + 1)
+    ).scalars().all()
+    truncated = len(rows) > _BOARD_ITEM_CAP
+    rows = rows[:_BOARD_ITEM_CAP]
+
+    audit_action(
+        request, session, subject, "governance:board", "allowed", project_id,
+        metadata={"total": total, "returned": len(rows), "truncated": truncated},
+    )
     return {
         "project_id": project_id,
-        "total": len(rows),
+        "total": total,
         "by_status": by_status,
         "by_kind": by_kind,
         "cost_impact_cny": round(cost, 2),
+        "truncated": truncated,
+        "item_cap": _BOARD_ITEM_CAP,
         "items": [
             {
                 "id": row.id,
@@ -80,7 +130,7 @@ def board(
                 "rule_hint": row.rule_hint,
                 "detected_at": row.detected_at if isinstance(row.detected_at, str) else "",
             }
-            for row in rows[:50]
+            for row in rows
         ],
     }
 

@@ -48,12 +48,20 @@ def ready(session: Session = Depends(db_session)) -> JSONResponse:
                 "request_id": get_request_id(),
             },
         )
+    # 漂移快照在**启动时**采样一次（见 ``startup.schema_drift_snapshot`` 的说明）：
+    # 探针每 10 秒一次，列级 introspection 放进来会把就绪检查变成数据库负载。
+    # 这里只读缓存，因此探针本身仍然是一次 ``SELECT 1``。
+    from rg_api.startup import schema_drift_snapshot
+
+    snapshot = schema_drift_snapshot()
     return JSONResponse(
         status_code=200,
         content={
             "status": "ok",
             "database": "ok",
             "dialect": settings.DB_DIALECT.value,
+            "schema_drift": snapshot["schema_drift"],
+            "schema_drift_checked_at": snapshot["schema_drift_checked_at"],
             "request_id": get_request_id(),
         },
     )

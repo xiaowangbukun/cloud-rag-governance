@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import Any
 
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Connection, Engine
@@ -121,29 +123,158 @@ def required_tables() -> tuple[str, ...]:
     return tuple(sorted(Base.metadata.tables))
 
 
-def verify_schema(engine: Engine | None = None) -> None:
+#: 列级漂移的类别（``docs/schema-bootstrap-governance.md`` 方案 2 部件 B / R4）。
+DRIFT_MISSING_TABLE = "missing_table"
+DRIFT_MISSING_COLUMN = "missing_column"
+DRIFT_TYPE_MISMATCH = "type_mismatch"
+DRIFT_EXTRA_COLUMN = "extra_column"
+
+#: 类型渲染的同义写法：同一个类型经「元数据渲染」与「数据库反射」两条路径出来
+#: 的字符串不同（如 ``String(32)`` 渲染为 ``VARCHAR(32)``、PG 反射回来是
+#: ``CHARACTER VARYING(32)``）。这里只收**实测撞到**的同义写法，且只做整词替换：
+#: 长度/精度永不合并，否则 ``VARCHAR(32)`` 与 ``VARCHAR(255)`` 的差异会被吞掉。
+#: 新增别名前必须先让 ``test_fresh_schema_has_no_drift`` 证明它是假阳性。
+_TYPE_ALIASES: tuple[tuple[str, str], ...] = (
+    ("CHARACTER VARYING", "VARCHAR"),
+    ("DOUBLE PRECISION", "FLOAT"),
+    ("TIMESTAMP WITHOUT TIME ZONE", "TIMESTAMP"),
+    ("TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ"),
+)
+
+
+def _render_type(type_: Any, dialect: Any) -> str:
+    """把列类型渲染成可比较的规范字符串（渲染失败退化为类名，不因此抛异常）。"""
+    try:
+        rendered = str(type_.compile(dialect=dialect)).upper()
+    except Exception:  # noqa: BLE001 —— 自定义类型渲染失败不该让启动挂掉
+        rendered = type_.__class__.__name__.upper()
+    for alias, canonical in _TYPE_ALIASES:
+        rendered = rendered.replace(alias, canonical)
+    # 整词替换：``INT`` → ``INTEGER``，但不会把 ``INTEGER`` 改成 ``INTEGEREGER``。
+    rendered = re.sub(r"\bINT\b", "INTEGER", rendered)
+    return re.sub(r"\s+", " ", rendered).strip()
+
+
+def schema_drift(engine: Engine | None = None, *, include_extra: bool = True) -> list[dict[str, str]]:
+    """比对「模型元数据」与「库里实际列」，返回差异清单（空列表 = 一致）。
+
+    为什么需要它：``create_all`` 只建**缺失的表**，既不给已存在的表加列，也不
+    改列类型；``verify_schema`` 过去只比表名，于是「列被改名/类型被改掉」这类
+    漂移全程无信号——查询在第一次碰到那列时才 500。这里把漂移变成**可读清单**：
+    ``/ready`` 暴露、启动日志分级记录、``migrate --verify`` 也可据此判定。
+
+    四类差异（``kind`` 字段）：
+    - ``missing_table``：模型有、库里没有（等价于 ``verify_schema`` 的旧判定）；
+    - ``missing_column``：模型有、库里没有（多半是部署 Job 没跑，查询必然 500）；
+    - ``type_mismatch``：两侧列类型渲染不一致（**不自动修**，需人工 DDL）；
+    - ``extra_column``：库里有、模型没有（来历不明的列，需确认是否该删）。
+
+    刻意不做的事：不比对索引、外键、默认值、可空性。它们不在 R4 的范围内，
+    且自动比对会产生大量方言噪声（尤其 ``with_variant`` 的 ``TS()`` 与
+    ``JsonDict()``）。要扩展时先解决噪声，再扩这个函数。
+    """
+    from sqlalchemy import inspect
+
+    import rg_contracts.db.models  # noqa: F401  (register all models on Base.metadata)
+    from rg_contracts.db.base import Base
+
+    target = engine or get_engine()
+    inspector = inspect(target)
+    existing_tables = set(inspector.get_table_names())
+    drift: list[dict[str, str]] = []
+
+    for table in Base.metadata.tables.values():
+        name = table.name
+        if name not in existing_tables:
+            drift.append(
+                {
+                    "table": name,
+                    "kind": DRIFT_MISSING_TABLE,
+                    "column": "",
+                    "detail": "表不存在",
+                }
+            )
+            continue
+        actual = {column["name"]: column["type"] for column in inspector.get_columns(name)}
+        for column in table.columns:
+            if column.name not in actual:
+                drift.append(
+                    {
+                        "table": name,
+                        "kind": DRIFT_MISSING_COLUMN,
+                        "column": column.name,
+                        "detail": f"期望 {_render_type(column.type, target.dialect)}",
+                    }
+                )
+                continue
+            expected = _render_type(column.type, target.dialect)
+            found = _render_type(actual[column.name], target.dialect)
+            if expected != found:
+                drift.append(
+                    {
+                        "table": name,
+                        "kind": DRIFT_TYPE_MISMATCH,
+                        "column": column.name,
+                        "detail": f"元数据 {expected} / 库内 {found}",
+                    }
+                )
+        if include_extra:
+            model_columns = {column.name for column in table.columns}
+            for column_name, column_type in actual.items():
+                if column_name not in model_columns:
+                    drift.append(
+                        {
+                            "table": name,
+                            "kind": DRIFT_EXTRA_COLUMN,
+                            "column": column_name,
+                            "detail": f"库内 {_render_type(column_type, target.dialect)}",
+                        }
+                    )
+    return drift
+
+
+def verify_schema(engine: Engine | None = None) -> list[dict[str, str]]:
     """只校验、不建表：用于 ``DB_MIGRATE_ON_STARTUP=false`` 的生产运行角色。
 
     为什么要有这一步而不是直接跳过初始化：运行角色没有 DDL 权限，若 schema
     尚未由部署 Job 建好，应用会「启动成功、每个请求 500」，把部署顺序错误伪装
     成运行时故障。这里在启动时一次性列出缺哪些表并给出修复命令，属 fail-fast。
 
-    Raises:
-        RuntimeError: 存在缺失的表（消息含表名清单与迁移命令）。
-    """
-    from sqlalchemy import inspect
+    **缺列也 fail-fast**（比文档原方案更严一点，理由在此写清）：缺表会被
+    SQLAlchemy 在第一次查询时以「relation does not exist」挡住，而缺列同样会让
+    每条碰到该列的查询 500——两者都是「部署顺序错了」，没有理由只挡前者。
+    ``type_mismatch`` / ``extra_column`` 则**不 fail-fast**：存量库可能带着历史类型
+    差异正常跑，硬失败会让升级窗口直接起不来；它们改为返回给调用方，由
+    ``/ready`` 的 ``schema_drift`` 字段与启动日志暴露。
 
+    Returns:
+        完整的漂移清单（空列表 = 无漂移），供启动流程缓存并暴露到 ``/ready``。
+
+    Raises:
+        RuntimeError: 存在缺失的表或缺列（消息含修复命令）。
+    """
     target = engine or get_engine()
-    existing = set(inspect(target).get_table_names())
-    missing = [name for name in required_tables() if name not in existing]
-    if not missing:
-        return
-    raise RuntimeError(
-        f"schema 未就绪：缺少 {len(missing)} 张表（{', '.join(missing[:8])}"
-        f"{' 等' if len(missing) > 8 else ''}）。"
-        "当前进程以 DB_MIGRATE_ON_STARTUP=false 运行，不会建表；"
-        "请先以属主身份执行 `python -m rg_contracts.db.migrate`（部署侧为 schema-init Job）。"
-    )
+    drift = schema_drift(target)
+    missing_tables = [item["table"] for item in drift if item["kind"] == DRIFT_MISSING_TABLE]
+    if missing_tables:
+        raise RuntimeError(
+            f"schema 未就绪：缺少 {len(missing_tables)} 张表（{', '.join(missing_tables[:8])}"
+            f"{' 等' if len(missing_tables) > 8 else ''}）。"
+            "当前进程以 DB_MIGRATE_ON_STARTUP=false 运行，不会建表；"
+            "请先以属主身份执行 `python -m rg_contracts.db.migrate`（部署侧为 schema-init Job）。"
+        )
+    missing_columns = [
+        f"{item['table']}.{item['column']}"
+        for item in drift
+        if item["kind"] == DRIFT_MISSING_COLUMN
+    ]
+    if missing_columns:
+        raise RuntimeError(
+            f"schema 未就绪：缺少 {len(missing_columns)} 个列（{', '.join(missing_columns[:8])}"
+            f"{' 等' if len(missing_columns) > 8 else ''}）。"
+            "当前进程不会补列；请先以属主身份执行 `python -m rg_contracts.db.migrate`。"
+        )
+    return drift
 
 
 #: 需要「保证存在」的后加列清单：(表名, 列名, 可直接拼进 ALTER TABLE 的列定义)。

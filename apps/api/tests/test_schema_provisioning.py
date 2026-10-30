@@ -43,7 +43,9 @@ def test_verify_schema_fails_fast_on_empty_database(tmp_path):
         verify_schema(empty)
     message = str(excinfo.value)
     assert "schema 未就绪" in message
-    assert "audit_log" in message, "错误信息应列出缺失的表名"
+    # 空库缺 20+ 张表，错误信息只列前 8 个（按模型定义顺序，全列会刷屏）；
+    # 断言取首个名字，保证「确实列出了表名」而不是只给一句泛泛的报错。
+    assert "organization" in message, "错误信息应列出缺失的表名（前 8 个）"
     assert "rg_contracts.db.migrate" in message, "错误信息应给出可执行的修复命令"
 
 
@@ -53,8 +55,17 @@ def _settings(migrate_on_startup: bool):
 
 def test_prepare_schema_initializes_when_enabled(monkeypatch):
     calls: list[str] = []
-    monkeypatch.setattr(startup, "ensure_schema", lambda: calls.append("ensure"))
-    monkeypatch.setattr(startup, "verify_schema", lambda: calls.append("verify"))
+
+    def _ensure() -> list[int]:
+        calls.append("ensure")
+        return []
+
+    def _verify() -> list[dict[str, str]]:
+        calls.append("verify")
+        return []
+
+    monkeypatch.setattr(startup, "ensure_schema", _ensure)
+    monkeypatch.setattr(startup, "verify_schema", _verify)
 
     startup._prepare_schema(_settings(True))
 
@@ -62,13 +73,24 @@ def test_prepare_schema_initializes_when_enabled(monkeypatch):
 
 
 def test_prepare_schema_only_verifies_when_disabled(monkeypatch):
+    """关闭迁移时只做校验；``verify_schema`` 返回的漂移清单要被记进快照（不再返回 None）。"""
     calls: list[str] = []
-    monkeypatch.setattr(startup, "ensure_schema", lambda: calls.append("ensure"))
-    monkeypatch.setattr(startup, "verify_schema", lambda: calls.append("verify"))
+
+    def _ensure() -> list[int]:
+        calls.append("ensure")
+        return []
+
+    def _verify() -> list[dict[str, str]]:
+        calls.append("verify")
+        return []
+
+    monkeypatch.setattr(startup, "ensure_schema", _ensure)
+    monkeypatch.setattr(startup, "verify_schema", _verify)
 
     startup._prepare_schema(_settings(False))
 
     assert calls == ["verify"], "关闭迁移时绝不能执行任何 DDL"
+    assert startup.schema_drift_snapshot()["schema_drift"] == []
 
 
 def test_bootstrap_skips_vector_index_ddl_when_migrate_disabled(monkeypatch):

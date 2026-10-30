@@ -9,13 +9,13 @@
 
     python -m rg_contracts.db.migrate            # 建表 + 执行未登记迁移（默认）
     python -m rg_contracts.db.migrate --plan     # dry-run：只打印待执行迁移，不执行
-    python -m rg_contracts.db.migrate --verify   # 只校验 schema 是否就绪，不建表
+    python -m rg_contracts.db.migrate --verify   # 只校验 schema（缺表/缺列），不建表
 
 ``--plan`` 是给离线客户做变更评审用的（``docs/schema-bootstrap-governance.md``
 方案 2 部件 C / R10）：它走与 ``apply_pending`` 完全相同的判定
 （``schema_migrations.pending_migrations``），只打印不执行。
 
-退出码：0 成功；``--verify`` 检测到缺表返回 1；其余异常直接以非零退出
+退出码：0 成功；``--verify`` 检测到缺表或缺列返回 1；其余异常直接以非零退出
 （Job 失败即中止发布，不把半成品放行）。
 """
 
@@ -45,7 +45,7 @@ def _build_parser() -> argparse.ArgumentParser:
     mode.add_argument(
         "--verify",
         action="store_true",
-        help="只校验：缺表即返回非零退出码，不建表、不跑迁移",
+        help="只校验：缺表或缺列即返回非零退出码，不建表、不跑迁移",
     )
     return parser
 

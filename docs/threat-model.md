@@ -35,7 +35,7 @@
 | T15 | 容器内提权 / 横向移动 | 非 root、只读根文件系统、丢弃全部 Capabilities、默认拒绝入站 NetworkPolicy | `apps/api/Dockerfile`、`deploy/k8s/06-networkpolicy.yaml` |
 | T16 | XSS / 点击劫持 | CSP + X-Frame-Options + nosniff + Referrer-Policy | `apps/web/nginx.conf`、`errors.py` |
 | T17 | 模型不可用导致治理中断 | 降级为规则归因，链路不中断并在响应标注 `evidence_level=rule` | `ai/gateway.py::_rule_based_result` |
-| T18 | 新接口漏写 `WHERE` 导致越权（应用层过滤单点失效） | PostgreSQL RLS：六张受保护表 `ENABLE + FORCE`，作用域走 `app.rls_*` 会话变量；未设上下文即 0 行；请求会话初始作用域为「无授权」 | `db/rls.py`；`test_rls.py::test_leaky_query_without_where_is_contained`、`test_request_session_without_auth_is_denied` |
+| T18 | 新接口漏写 `WHERE` 导致越权（应用层过滤单点失效） | PostgreSQL RLS：八张受保护表（`resource`/`resource_diff`/`snapshot_state`/`knowledge_document`/`knowledge_chunk`/`attribution`/`resource_metric`/`gpu_node`）`ENABLE + FORCE`，作用域走 `app.rls_*` 会话变量；未设上下文即 0 行；请求会话初始作用域为「无授权」 | `db/rls.py`；`test_rls.py::test_leaky_query_without_where_is_contained`、`test_request_session_without_auth_is_denied` |
 | T19 | 检索静默降级（该看到的看不到，且无人发现） | 40 题金标准 + CI `eval-gate`：泄漏率与拒答率硬门禁、召回对照基线；报告自报 `decision_grade` | `eval/rag_baseline.py`、`rg_api.eval`；`test_rag_eval.py`、`test_retrieval_level_filter.py` |
 
 ## 明确的非目标

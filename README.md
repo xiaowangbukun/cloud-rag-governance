@@ -38,7 +38,7 @@ cd apps/web && npm install && npm run dev            # http://localhost:5173
 | 端点 | 语义 | 失败时 |
 |---|---|---|
 | `GET /health` | 存活探针：只证明进程还在，不碰任何依赖 | —（依赖故障不重启进程） |
-| `GET /ready` | 就绪探针：执行 `SELECT 1` | 数据库不可达返回 **503**，由 LB 摘流量 |
+| `GET /ready` | 就绪探针：执行 `SELECT 1`，并返回启动时采样的 `schema_drift` / `schema_drift_checked_at` | 数据库不可达返回 **503**，由 LB 摘流量；列级漂移作为可观测字段返回（不在探针里重新 introspection） |
 | `GET /metrics` | Prometheus 抓取：请求数 + 耗时直方图 | 关闭时 404；**不鉴权，只能经集群内网访问** |
 
 安全事件查询（`GET /audit/security-events`）需要 `security:read` 能力位，且按项目授权收口：非全局角色只能看到自己已授权项目的事件（事件 `project_id` 为空表示全局事件，仅全局角色可见）。
@@ -142,7 +142,8 @@ K8s 清单要点：只读根文件系统 + 非 root + 丢弃全部 Capabilities�
 
 应用层过滤漏写一个 `WHERE` 就等于越权，而且不报错、不进日志。因此同一条边界在
 PostgreSQL 里再写一次：`resource` / `resource_diff` / `snapshot_state` /
-`knowledge_document` / `knowledge_chunk` / `attribution` 六张表启用
+`knowledge_document` / `knowledge_chunk` / `attribution` / `resource_metric` /
+`gpu_node` 八张表启用
 `ENABLE + FORCE ROW LEVEL SECURITY`，策略读会话变量 `app.rls_*`（`SET LOCAL`
 语义，事务结束失效）。
 
@@ -488,8 +489,10 @@ cloud-rag-governance/
 ## 六、已知限制与下一步
 
 - 表结构由 SQLAlchemy 元数据 + 显式迁移注册表引导：`create_all` 只建缺失的表，后加列/索引由 `rg_contracts/db/schema_migrations.py` 的注册表按版本执行并登记到 `schema_version` 表（见 `docs/schema-bootstrap-governance.md` §8）。`python -m rg_contracts.db.migrate --plan` 可打印待执行清单供变更评审（dry-run，不执行）
+- 列级漂移在**启动时**采样一次：缺表/缺列 fail-fast（运行角色没有 DDL 权限，缺列就是运行时 500）；`type_mismatch` / `extra_column` 只记 ERROR 并写入 `/ready` 的 `schema_drift`，不阻断启动。运行时手工 `ALTER` 只能下次重启或 `migrate --verify` 才发现（明示的采样窗口）
+- 迁移在 PostgreSQL 上先抢会话级 advisory lock：多 Pod / Job 与手工重跑撞车时「先到者执行、后到者跳过」（跳过是安全的，迁移幂等）
 - 未引入 Alembic（判据见 `docs/schema-bootstrap-governance.md` §3 方案 3）；`apps/api/pyproject.toml` 里原有的 `alembic>=1.13` 属预留声明、代码零调用，已连同其传递依赖从声明与本地环境移除（需要切换时按判据重新引入）
-- PostgreSQL 生产环境滚动升级前仍需按 runbook 以属主身份执行 `python -m rg_contracts.db.migrate`（多 Pod 并发 DDL 与列级漂移校验尚未治理）
+- PostgreSQL 生产环境滚动升级前仍需按 runbook 以属主身份执行 `python -m rg_contracts.db.migrate`；等价手工 SQL 与回滚步骤尚未写成 runbook（`docs/schema-bootstrap-governance.md` §8.4）
 - `COLLECTOR_MODE=simulated` 为内置模拟数据；切到 `api` 需在各云适配器中填入真实凭证与分页/签名逻辑
 - 指标只保留最新值：`resource_metric` 每轮采集 upsert 覆盖，没有历史序列；趋势分析需要另建明细表
 - D1 利用率/浪费判定目前只有一条规则（`d1_gpu_utilization_waste`：`gpu_node` 的 `gpu_utilization` 低于阈值且 `allocated_gpus > 0`）；容量/合规/版本漂移等 D 系列尚未实现，阈值不支持按平台差异化
@@ -506,7 +509,7 @@ cloud-rag-governance/
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | **P1 摄取与切块** | 文件级摄取（Markdown/PDF）、标题感知切块、出处字段（`section_path` / `page_no` / 字符偏移） | 切块与 PDF 抽取模块、数据模型已落地 |
-| **P2 混合检索** | 应用层 BM25（中文 bigram）+ 向量 RRF 融合 + 可插拔重排（默认融合，HTTP 重排可选） | BM25 模块已落地，融合与重排待接 |
+| **P2 混合检索** | 应用层 BM25（中文 bigram）+ 向量与 BM25 的线性加权融合（`RAG_HYBRID_ENABLED` + `RAG_HYBRID_ALPHA`，默认关闭）；可插拔重排仍为后续选项 | BM25 与线性融合已实现（默认关，需真实语料对照后再翻转）；RRF 与重排未实现（原预留配置键无代码消费，已删除） |
 | **P3 抽象与工程** | `StoragePort` 端口（授权过滤必须是第一个动作）、`rg` CLI（ingest/search/ask/serve）、离线部署形态、许可 | 许可已补齐 |
 | **P4 语料验收** | 领域示例语料 + 问答集，指标：`recall@5 ≥ 0.8`、引用章节正确率 ≥ 0.8 | `samples/ops-docs/` 已备 6 篇 |
 

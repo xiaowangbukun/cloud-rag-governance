@@ -34,15 +34,64 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from sqlalchemy import select
-from sqlalchemy.engine import Engine
+from sqlalchemy import select, text
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import Session
 
 from rg_contracts.db.models import SchemaVersion, ts
+from rg_contracts.logging_setup import get_logger, log_event
+
+logger = get_logger(__name__)
+
+#: 迁移互斥锁的键。**会话级** advisory lock（``pg_try_advisory_lock``），
+#: 与 ``apps/api/tests/conftest.py`` 的写法一致：拿不到锁说明别的 Pod / 别的
+#: 运维会话正在跑迁移，本次直接跳过。
+#:
+#: 为什么需要它：``create_all`` + ``ALTER TABLE`` 是 DDL，多 Pod 同时启动（或
+#: Job 与手工重跑撞车）会并发执行；迁移本身幂等，但并发 DDL 在 PG 上会互相
+#: 阻塞甚至因竞争拿到不一致的表结构。加锁后行为退化为「先到者执行、后到者跳过」
+#: ——跳过是安全的，因为先到者跑完后 schema 就是目标状态。
+LOCK_KEY = "rg_contracts.db.schema_migrations"
+
+
+def _try_advisory_lock(engine: Engine) -> Connection | None:
+    """PG：尝试拿会话级锁。拿到返回**持锁连接**（调用方负责释放/关闭）。
+
+    非 PG 方言返回 ``None`` 且不做任何事：SQLite 是单文件、单进程语义明确
+    （测试库另有 destructive-reset 闸门），没有行为变化。
+    """
+    if engine.dialect.name != "postgresql":
+        return None
+    lock_conn = engine.connect()
+    acquired = bool(
+        lock_conn.execute(
+            text("SELECT pg_try_advisory_lock(hashtext(:key))"), {"key": LOCK_KEY}
+        ).scalar()
+    )
+    # 立即使事务进入 idle：会话级锁不受 commit 影响，但悬着的事务会让
+    # ``idle_in_transaction_session_timeout`` 有理由杀掉连接（锁随之静默丢失）。
+    lock_conn.commit()
+    if not acquired:
+        lock_conn.close()
+        return None
+    return lock_conn
+
+
+def _release_advisory_lock(lock_conn: Connection) -> None:
+    try:
+        lock_conn.execute(
+            text("SELECT pg_advisory_unlock(hashtext(:key))"), {"key": LOCK_KEY}
+        )
+        lock_conn.commit()
+    except Exception:  # noqa: BLE001 —— 释放失败不应掩盖迁移结果；连接关闭也会释放
+        log_event(logger, logging.WARNING, "migration lock release failed", key=LOCK_KEY)
+    finally:
+        lock_conn.close()
 
 
 @dataclass(frozen=True)
@@ -152,7 +201,31 @@ def apply_pending(engine: Engine) -> list[int]:
 
     ``schema_version`` 表必须已存在：它由 ``create_all`` 建出（表在 ORM 元数据里，
     不存在鸡生蛋问题）。调用顺序因此固定为「先 create_all、再 apply_pending」。
+
+    PG 上加一把**会话级 advisory lock**：抢不到锁说明别的进程正在迁移本库，
+    本次返回空列表（跳过）并记一条 warning。跳过是安全的——迁移幂等，先到者
+    跑完后 schema 即目标状态；而不加锁的并发 DDL 会互相阻塞甚至留下半套结构。
     """
+    if engine.dialect.name == "postgresql":
+        lock_conn = _try_advisory_lock(engine)
+        if lock_conn is None:
+            log_event(
+                logger,
+                logging.WARNING,
+                "migration skipped: another process holds the lock",
+                key=LOCK_KEY,
+                impact="本次不执行迁移；schema 由持锁进程改写",
+            )
+            return []
+        try:
+            return _apply_all(engine)
+        finally:
+            _release_advisory_lock(lock_conn)
+    return _apply_all(engine)
+
+
+def _apply_all(engine: Engine) -> list[int]:
+    """实际的执行体：按 version 顺序执行 + 逐条登记（调用方负责加锁）。"""
     applied: list[int] = []
     for migration in pending_migrations(engine):
         started = time.perf_counter()
